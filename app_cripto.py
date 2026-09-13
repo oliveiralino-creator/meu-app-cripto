@@ -236,75 +236,82 @@ with tab2:
             st.rerun()
 
 # ==========================================
-# ABA 3: BACKTESTING TÉCNICO (VETORIZADO E AUDITÁVEL)
+# ABA 3: BACKTESTING TÉCNICO AVANÇADO (PARAMETRIZADO)
 # ==========================================
 with tab3:
-    st.subheader("Motor de Backtesting (Algoritmo vs Buy & Hold)")
-    st.markdown("Testa regras matemáticas no passado (Dados Diários). Não inclui análise de notícias.")
+    st.subheader("Motor de Backtesting (Otimização de Parâmetros)")
+    st.markdown("Calibre os níveis de exigência do robô para encontrar o ponto de equilíbrio entre agressividade e proteção.")
     
     colA, colB = st.columns(2)
     ativo_bt = colA.selectbox("Ativo para Testar:", ["BTC-USD", "ETH-USD", "SOL-USD", "BNB-USD", "XRP-USD"])
-    periodo_bt = colB.selectbox("Período Histórico:", ["1y", "6mo", "2y"])
+    periodo_bt = colB.selectbox("Período Histórico:", ["1y", "6mo", "2y", "max"])
     
-    if st.button("▶️ Rodar Simulação Histórica"):
-        with st.spinner("Baixando dados e calculando..."):
+    st.markdown("#### ⚙️ Calibração do Algoritmo")
+    col_slider1, col_slider2 = st.columns(2)
+    # Sliders para tunar o robô na interface
+    gatilho_compra = col_slider1.slider("Gatilho de Compra (Quão forte deve ser a tendência?):", min_value=50, max_value=90, value=75, step=5, help="Valores altos compram tarde, com mais segurança. Valores baixos compram cedo, com mais risco.")
+    gatilho_venda = col_slider2.slider("Gatilho de Venda (Quão fraca deve ficar a tendência?):", min_value=30, max_value=60, value=45, step=5, help="Valores altos vendem em qualquer respiro. Valores baixos seguram a moeda por mais tempo nas quedas.")
+    
+    if st.button("▶️ Rodar Simulação Parametrizada"):
+        with st.spinner("Processando dados e aplicando matriz de decisão..."):
             hist = yf.download(ativo_bt, period=periodo_bt, progress=False)
             
             if not hist.empty:
-                # Trata o formato de colunas do Yahoo Finance
                 if isinstance(hist.columns, pd.MultiIndex):
                     hist.columns = hist.columns.get_level_values(0)
                 
-                # 1. Cálculos Matemáticos (Diários)
+                # Indicadores
                 hist['RSI'] = calculate_rsi(hist['Close'].values, period=14)
-                hist['SMA_50'] = hist['Close'].rolling(window=50).mean()
+                hist['EMA_9'] = hist['Close'].ewm(span=9, adjust=False).mean()
+                hist['EMA_21'] = hist['Close'].ewm(span=21, adjust=False).mean()
                 
-                # 2. Score Matemático (0 a 100)
+                exp1 = hist['Close'].ewm(span=12, adjust=False).mean()
+                exp2 = hist['Close'].ewm(span=26, adjust=False).mean()
+                hist['MACD'] = exp1 - exp2
+                hist['Signal_Line'] = hist['MACD'].ewm(span=9, adjust=False).mean()
+                
+                # Sistema de Score
                 hist['Score_BT'] = 50
-                hist.loc[hist['RSI'] < 30, 'Score_BT'] += 20 # Sobrevendido = Pontos
-                hist.loc[hist['RSI'] > 70, 'Score_BT'] -= 20 # Sobrecomprado = Perde pontos
-                hist.loc[hist['Close'] > hist['SMA_50'], 'Score_BT'] += 20 # Tendência de Alta
-                hist.loc[hist['Close'] < hist['SMA_50'], 'Score_BT'] -= 20 # Tendência de Baixa
+                hist.loc[hist['RSI'] < 40, 'Score_BT'] += 10 
+                hist.loc[hist['RSI'] > 75, 'Score_BT'] -= 20
+                hist.loc[hist['EMA_9'] > hist['EMA_21'], 'Score_BT'] += 20
+                hist.loc[hist['EMA_9'] <= hist['EMA_21'], 'Score_BT'] -= 20
+                hist.loc[hist['MACD'] > hist['Signal_Line'], 'Score_BT'] += 20
+                hist.loc[hist['MACD'] <= hist['Signal_Line'], 'Score_BT'] -= 20
                 
-                # 3. Lógica de Posição (Vetorizada)
-                # 1 = Comprado, 0 = Vendido (Fora do mercado)
+                # Aplicação dos Gatilhos Personalizados (Sliders)
                 hist['Sinal_Temporario'] = np.nan
-                hist.loc[hist['Score_BT'] > 65, 'Sinal_Temporario'] = 1 # Compra Forte
-                hist.loc[hist['Score_BT'] < 40, 'Sinal_Temporario'] = 0 # Venda
+                hist.loc[hist['Score_BT'] >= gatilho_compra, 'Sinal_Temporario'] = 1 
+                hist.loc[hist['Score_BT'] <= gatilho_venda, 'Sinal_Temporario'] = 0 
                 
-                # Preenche os dias sem sinal com a última decisão tomada (ffill)
                 hist['Posicao'] = hist['Sinal_Temporario'].ffill().fillna(0)
                 
-                # 4. Cálculo de Retornos (shift(1) garante que compramos no fechamento de ontem para lucrar hoje)
+                # Cálculo Financeiro
                 hist['Retorno_Ativo'] = hist['Close'].pct_change()
                 hist['Retorno_Robo'] = hist['Retorno_Ativo'] * hist['Posicao'].shift(1)
                 
                 hist['Acumulado_Hold'] = (1 + hist['Retorno_Ativo']).cumprod() - 1
                 hist['Acumulado_Robo'] = (1 + hist['Retorno_Robo']).cumprod() - 1
                 
-                # 5. Gráfico de Comparação
+                # Visualização
                 fig = go.Figure()
                 fig.add_trace(go.Scatter(x=hist.index, y=hist['Acumulado_Hold']*100, mode='lines', name='Buy & Hold (%)', line=dict(color='gray')))
-                fig.add_trace(go.Scatter(x=hist.index, y=hist['Acumulado_Robo']*100, mode='lines', name='Robô (%)', line=dict(color='green', width=2)))
-                fig.update_layout(title="Lucro Acumulado: Robô vs Segurar a Moeda", yaxis_title="Retorno (%)", template='plotly_white')
+                fig.add_trace(go.Scatter(x=hist.index, y=hist['Acumulado_Robo']*100, mode='lines', name='Robô Parametrizado (%)', line=dict(color='green', width=2)))
+                fig.update_layout(title=f"Performance com Compra >= {gatilho_compra} e Venda <= {gatilho_venda}", yaxis_title="Retorno (%)", template='plotly_white')
                 st.plotly_chart(fig, use_container_width=True)
                 
-                # 6. Métricas
-                c1, c2 = st.columns(2)
+                # Métricas
                 lucro_bh = hist['Acumulado_Hold'].iloc[-1] * 100
                 lucro_est = hist['Acumulado_Robo'].iloc[-1] * 100
+                mudancas_posicao = hist['Posicao'].diff().abs().sum() / 2
+                
+                c1, c2, c3 = st.columns(3)
                 c1.metric("Resultado Buy & Hold", f"{lucro_bh:.2f}%")
                 c2.metric("Resultado Robô", f"{lucro_est:.2f}%", f"{lucro_est - lucro_bh:.2f}% de diferença")
+                c3.metric("Quantidade de Trades", f"{int(mudancas_posicao)}")
 
-                # 7. Botão de Auditoria (Exportar para CSV)
-                df_export = hist[['Close', 'RSI', 'SMA_50', 'Score_BT', 'Posicao', 'Retorno_Ativo', 'Retorno_Robo']].dropna().round(4)
+                df_export = hist[['Close', 'RSI', 'EMA_9', 'EMA_21', 'MACD', 'Score_BT', 'Posicao', 'Retorno_Robo']].dropna().round(4)
                 csv_bt = df_export.to_csv().encode('utf-8')
-                st.divider()
-                st.download_button(
-                    label="📥 Baixar Dados do Backtest (Auditar Lógica no Excel)",
-                    data=csv_bt,
-                    file_name=f'backtest_{ativo_bt}.csv',
-                    mime='text/csv'
-                )
+                st.download_button(label="📥 Baixar Série Histórica Auditável", data=csv_bt, file_name=f'backtest_parametrizado_{ativo_bt}.csv', mime='text/csv')
             else:
-                st.error("Falha ao puxar dados do Yahoo Finance.")
+                st.error("Falha ao puxar dados.")
