@@ -4,6 +4,3 @@ requests
 plotly
 numpy
 feedparser
-matplotlib
-google-generativeai
-yfinance
