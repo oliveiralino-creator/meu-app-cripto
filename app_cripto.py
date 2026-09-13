@@ -151,7 +151,7 @@ ativos_selecionados = st.sidebar.multiselect("Filtrar Moedas no Radar:", options
 tab1, tab2, tab3 = st.tabs(["📊 Radar de Mercado", "💼 Simulador de Carteira", "⏪ Backtesting Técnico"])
 
 # ==========================================
-# ABA 1: RADAR DE MERCADO (Gráfico e Variação 1h Reintegrados)
+# ABA 1: RADAR DE MERCADO (Gráfico com Datas e Horas Reais)
 # ==========================================
 with tab1:
     latest_news = get_crypto_news(ativos_selecionados)
@@ -174,26 +174,48 @@ with tab1:
         
         df_view = df[df['Ativo'].isin(ativos_selecionados)] if ativos_selecionados else df.copy()
 
-        # O Gráfico voltou! (Aparece se houverem moedas filtradas)
+        # Gráfico dinâmico com Eixo Temporal Real (Data e Hora)
         if ativos_selecionados and len(ativos_selecionados) <= 10:
             st.subheader(f"📈 Evolução de Preços - {', '.join(ativos_selecionados)}")
             chart_data = []
+            
+            # Hora atual arredondada para construir o eixo retrospectivo
+            agora = datetime.now(timezone.utc) - timedelta(hours=3) # Horário de Brasília
+            
             for index, row in df_view.iterrows():
                 prices = row.get('sparkline_in_7d', {}).get('price', [])
-                for i, price in enumerate(prices):
-                    chart_data.append({'Ativo': row['Ativo'], 'Hora': i, 'Preço USD': price})
+                total_pontos = len(prices)
+                
+                if prices:
+                    # Cria a linha do tempo retrocedendo hora a hora (exatamente a quantidade de pontos do sparkline)
+                    for i, price in enumerate(prices):
+                        # Subtrai horas de trás para frente para mapear o passado recente
+                        horas_atras = total_pontos - 1 - i
+                        ponto_tempo = agora - timedelta(hours=horas_atras)
+                        
+                        chart_data.append({
+                            'Ativo': row['Ativo'], 
+                            'Tempo': ponto_tempo, 
+                            'Preço USD': price
+                        })
+            
             if chart_data:
                 df_chart = pd.DataFrame(chart_data)
-                fig_line = px.line(df_chart, x='Hora', y='Preço USD', color='Ativo', template='plotly_white')
-                fig_line.update_xaxes(showticklabels=False, title="Linha do Tempo (Últimos 7 dias)") 
+                fig_line = px.line(df_chart, x='Tempo', y='Preço USD', color='Ativo', template='plotly_white')
+                
+                # Formatação interativa do eixo X para exibir Dia/Mês e Hora:Minuto
+                fig_line.update_xaxes(
+                    title="Linha do Tempo (Últimos 7 dias)",
+                    tickformat="%d/%m %H:%M",
+                    hoverformat="%d/%m/%Y %H:%M"
+                )
                 st.plotly_chart(fig_line, use_container_width=True)
                 st.divider()
 
-        # Configuração da nova tabela (Agora com 1h incluído)
         cols_to_keep = {
             'Ativo': 'Ativo', 
             'current_price': 'Preço (USD)', 
-            'price_change_percentage_1h_in_currency': 'Var 1h (%)', # Novo dado adicionado
+            'price_change_percentage_1h_in_currency': 'Var 1h (%)', 
             'price_change_percentage_24h_in_currency': 'Var 24h (%)', 
             'Vol/Cap (%)': 'Vol/Cap (%)', 
             'Score Final': 'Score Final', 
@@ -275,8 +297,8 @@ with tab3:
     
     st.markdown("#### ⚙️ Calibração do Algoritmo")
     col_slider1, col_slider2 = st.columns(2)
-    gatilho_compra = col_slider1.slider("Gatilho de Compra (Quão forte deve ser a tendência?):", min_value=50, max_value=90, value=80, step=5)
-    gatilho_venda = col_slider2.slider("Gatilho de Venda (Quão fraca deve ficar a tendência?):", min_value=30, max_value=60, value=60, step=5)
+    gatilho_compra = col_slider1.slider("Gatilho de Compra:", min_value=50, max_value=90, value=80, step=5)
+    gatilho_venda = col_slider2.slider("Gatilho de Venda:", min_value=30, max_value=60, value=60, step=5)
     
     if st.button("▶️ Rodar Simulação Parametrizada"):
         with st.spinner("Processando dados e aplicando matriz de decisão..."):
@@ -312,6 +334,7 @@ with tab3:
                 
                 fig = go.Figure()
                 fig.add_trace(go.Scatter(x=hist.index, y=hist['Acumulado_Hold']*100, mode='lines', name='Buy & Hold (%)', line=dict(color='gray')))
+                # Linha corrigida abaixo:
                 fig.add_trace(go.Scatter(x=hist.index, y=hist['Acumulado_Robo']*100, mode='lines', name='Robô Parametrizado (%)', line=dict(color='green', width=2)))
                 fig.update_layout(title=f"Performance com Compra >= {gatilho_compra} e Venda <= {gatilho_venda}", yaxis_title="Retorno (%)", template='plotly_white')
                 st.plotly_chart(fig, use_container_width=True)
