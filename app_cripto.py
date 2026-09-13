@@ -77,7 +77,7 @@ def analyze_sentiment_ai(news_list, api_key):
     try:
         genai.configure(api_key=api_key)
         valid_model_name = next((m.name for m in genai.list_models() if 'generateContent' in m.supported_generation_methods), None)
-        if not valid_model_name: return analyze_sentiment_lexical(news_list), "Erro: Nenhum modelo de IA disponível para esta chave."
+        if not valid_model_name: return analyze_sentiment_lexical(news_list), "Erro: Nenhum modelo de IA disponível."
             
         model = genai.GenerativeModel(valid_model_name)
         titles = "\n".join([f"- {n['title']}" for n in news_list])
@@ -151,7 +151,7 @@ ativos_selecionados = st.sidebar.multiselect("Filtrar Moedas no Radar:", options
 tab1, tab2, tab3 = st.tabs(["📊 Radar de Mercado", "💼 Simulador de Carteira", "⏪ Backtesting Técnico"])
 
 # ==========================================
-# ABA 1: RADAR DE MERCADO (O App Original)
+# ABA 1: RADAR DE MERCADO (Gráfico e Variação 1h Reintegrados)
 # ==========================================
 with tab1:
     latest_news = get_crypto_news(ativos_selecionados)
@@ -174,10 +174,44 @@ with tab1:
         
         df_view = df[df['Ativo'].isin(ativos_selecionados)] if ativos_selecionados else df.copy()
 
-        cols_to_keep = {'Ativo': 'Ativo', 'current_price': 'Preço (USD)', 'price_change_percentage_24h_in_currency': 'Var 24h (%)', 'Vol/Cap (%)': 'Vol/Cap (%)', 'Score Final': 'Score Final', 'Ação Sugerida': 'Decisão Mestre'}
+        # O Gráfico voltou! (Aparece se houverem moedas filtradas)
+        if ativos_selecionados and len(ativos_selecionados) <= 10:
+            st.subheader(f"📈 Evolução de Preços - {', '.join(ativos_selecionados)}")
+            chart_data = []
+            for index, row in df_view.iterrows():
+                prices = row.get('sparkline_in_7d', {}).get('price', [])
+                for i, price in enumerate(prices):
+                    chart_data.append({'Ativo': row['Ativo'], 'Hora': i, 'Preço USD': price})
+            if chart_data:
+                df_chart = pd.DataFrame(chart_data)
+                fig_line = px.line(df_chart, x='Hora', y='Preço USD', color='Ativo', template='plotly_white')
+                fig_line.update_xaxes(showticklabels=False, title="Linha do Tempo (Últimos 7 dias)") 
+                st.plotly_chart(fig_line, use_container_width=True)
+                st.divider()
+
+        # Configuração da nova tabela (Agora com 1h incluído)
+        cols_to_keep = {
+            'Ativo': 'Ativo', 
+            'current_price': 'Preço (USD)', 
+            'price_change_percentage_1h_in_currency': 'Var 1h (%)', # Novo dado adicionado
+            'price_change_percentage_24h_in_currency': 'Var 24h (%)', 
+            'Vol/Cap (%)': 'Vol/Cap (%)', 
+            'Score Final': 'Score Final', 
+            'Ação Sugerida': 'Decisão Mestre'
+        }
         df_clean = df_view.rename(columns=cols_to_keep)[list(cols_to_keep.values())]
 
-        st.dataframe(df_clean.style.format({"Preço (USD)": "${:,.4f}", "Var 24h (%)": "{:.2f}%", "Vol/Cap (%)": "{:.1f}%", "Score Final": "{:.0f}"}).background_gradient(subset=['Score Final'], cmap='RdYlGn', vmin=0, vmax=100), use_container_width=True, hide_index=True)
+        st.dataframe(
+            df_clean.style.format({
+                "Preço (USD)": "${:,.4f}", 
+                "Var 1h (%)": "{:.2f}%", 
+                "Var 24h (%)": "{:.2f}%", 
+                "Vol/Cap (%)": "{:.1f}%", 
+                "Score Final": "{:.0f}"
+            }).background_gradient(subset=['Score Final'], cmap='RdYlGn', vmin=0, vmax=100), 
+            use_container_width=True, 
+            hide_index=True
+        )
 
 # ==========================================
 # ABA 2: SIMULADOR DE CARTEIRA
@@ -188,14 +222,10 @@ with tab2:
     
     ARQUIVO_CARTEIRA = 'carteira_virtual.csv'
     
-    # Formulário de Nova Ordem
     with st.form("form_ordem"):
         c1, c2, c3 = st.columns(3)
         ativo_sim = c1.selectbox("Ativo", options=lista_ativos if lista_ativos else ['BTC', 'ETH'])
-        
-        # Pega o preço atual para facilitar
         preco_atual_sugerido = df[df['Ativo'] == ativo_sim]['current_price'].values[0] if not df.empty and ativo_sim in lista_ativos else 0.0
-        
         preco_compra = c2.number_input("Preço de Compra (USD)", min_value=0.0, value=float(preco_atual_sugerido), format="%.4f")
         quantidade = c3.number_input("Quantidade de Moedas", min_value=0.0, value=1.0, format="%.4f")
         submit_ordem = st.form_submit_button("🛒 Registrar Compra Virtual")
@@ -210,12 +240,9 @@ with tab2:
             df_cart.to_csv(ARQUIVO_CARTEIRA, index=False)
             st.success(f"Posição de {quantidade} {ativo_sim} registrada com sucesso!")
 
-    # Exibição da Carteira Ativa e PnL (Profit and Loss)
     st.divider()
     if os.path.exists(ARQUIVO_CARTEIRA) and not df.empty:
         df_cart = pd.read_csv(ARQUIVO_CARTEIRA)
-        
-        # Cruza a carteira salva com os preços em tempo real
         precos_atuais = df[['Ativo', 'current_price']].rename(columns={'current_price': 'Preço_Atual'})
         df_cart = df_cart.merge(precos_atuais, on='Ativo', how='left')
         
@@ -236,11 +263,11 @@ with tab2:
             st.rerun()
 
 # ==========================================
-# ABA 3: BACKTESTING TÉCNICO AVANÇADO (PARAMETRIZADO)
+# ABA 3: BACKTESTING TÉCNICO (PARAMETRIZADO)
 # ==========================================
 with tab3:
     st.subheader("Motor de Backtesting (Otimização de Parâmetros)")
-    st.markdown("Calibre os níveis de exigência do robô para encontrar o ponto de equilíbrio entre agressividade e proteção.")
+    st.markdown("Calibre os níveis de exigência do robô para encontrar o ponto de equilíbrio.")
     
     colA, colB = st.columns(2)
     ativo_bt = colA.selectbox("Ativo para Testar:", ["BTC-USD", "ETH-USD", "SOL-USD", "BNB-USD", "XRP-USD"])
@@ -248,29 +275,23 @@ with tab3:
     
     st.markdown("#### ⚙️ Calibração do Algoritmo")
     col_slider1, col_slider2 = st.columns(2)
-    # Sliders para tunar o robô na interface
-    gatilho_compra = col_slider1.slider("Gatilho de Compra (Quão forte deve ser a tendência?):", min_value=50, max_value=90, value=75, step=5, help="Valores altos compram tarde, com mais segurança. Valores baixos compram cedo, com mais risco.")
-    gatilho_venda = col_slider2.slider("Gatilho de Venda (Quão fraca deve ficar a tendência?):", min_value=30, max_value=60, value=45, step=5, help="Valores altos vendem em qualquer respiro. Valores baixos seguram a moeda por mais tempo nas quedas.")
+    gatilho_compra = col_slider1.slider("Gatilho de Compra (Quão forte deve ser a tendência?):", min_value=50, max_value=90, value=80, step=5)
+    gatilho_venda = col_slider2.slider("Gatilho de Venda (Quão fraca deve ficar a tendência?):", min_value=30, max_value=60, value=60, step=5)
     
     if st.button("▶️ Rodar Simulação Parametrizada"):
         with st.spinner("Processando dados e aplicando matriz de decisão..."):
             hist = yf.download(ativo_bt, period=periodo_bt, progress=False)
-            
             if not hist.empty:
                 if isinstance(hist.columns, pd.MultiIndex):
                     hist.columns = hist.columns.get_level_values(0)
                 
-                # Indicadores
                 hist['RSI'] = calculate_rsi(hist['Close'].values, period=14)
                 hist['EMA_9'] = hist['Close'].ewm(span=9, adjust=False).mean()
                 hist['EMA_21'] = hist['Close'].ewm(span=21, adjust=False).mean()
-                
-                exp1 = hist['Close'].ewm(span=12, adjust=False).mean()
-                exp2 = hist['Close'].ewm(span=26, adjust=False).mean()
+                exp1, exp2 = hist['Close'].ewm(span=12, adjust=False).mean(), hist['Close'].ewm(span=26, adjust=False).mean()
                 hist['MACD'] = exp1 - exp2
                 hist['Signal_Line'] = hist['MACD'].ewm(span=9, adjust=False).mean()
                 
-                # Sistema de Score
                 hist['Score_BT'] = 50
                 hist.loc[hist['RSI'] < 40, 'Score_BT'] += 10 
                 hist.loc[hist['RSI'] > 75, 'Score_BT'] -= 20
@@ -279,30 +300,23 @@ with tab3:
                 hist.loc[hist['MACD'] > hist['Signal_Line'], 'Score_BT'] += 20
                 hist.loc[hist['MACD'] <= hist['Signal_Line'], 'Score_BT'] -= 20
                 
-                # Aplicação dos Gatilhos Personalizados (Sliders)
                 hist['Sinal_Temporario'] = np.nan
                 hist.loc[hist['Score_BT'] >= gatilho_compra, 'Sinal_Temporario'] = 1 
                 hist.loc[hist['Score_BT'] <= gatilho_venda, 'Sinal_Temporario'] = 0 
-                
                 hist['Posicao'] = hist['Sinal_Temporario'].ffill().fillna(0)
                 
-                # Cálculo Financeiro
                 hist['Retorno_Ativo'] = hist['Close'].pct_change()
                 hist['Retorno_Robo'] = hist['Retorno_Ativo'] * hist['Posicao'].shift(1)
-                
                 hist['Acumulado_Hold'] = (1 + hist['Retorno_Ativo']).cumprod() - 1
                 hist['Acumulado_Robo'] = (1 + hist['Retorno_Robo']).cumprod() - 1
                 
-                # Visualização
                 fig = go.Figure()
                 fig.add_trace(go.Scatter(x=hist.index, y=hist['Acumulado_Hold']*100, mode='lines', name='Buy & Hold (%)', line=dict(color='gray')))
                 fig.add_trace(go.Scatter(x=hist.index, y=hist['Acumulado_Robo']*100, mode='lines', name='Robô Parametrizado (%)', line=dict(color='green', width=2)))
                 fig.update_layout(title=f"Performance com Compra >= {gatilho_compra} e Venda <= {gatilho_venda}", yaxis_title="Retorno (%)", template='plotly_white')
                 st.plotly_chart(fig, use_container_width=True)
                 
-                # Métricas
-                lucro_bh = hist['Acumulado_Hold'].iloc[-1] * 100
-                lucro_est = hist['Acumulado_Robo'].iloc[-1] * 100
+                lucro_bh, lucro_est = hist['Acumulado_Hold'].iloc[-1] * 100, hist['Acumulado_Robo'].iloc[-1] * 100
                 mudancas_posicao = hist['Posicao'].diff().abs().sum() / 2
                 
                 c1, c2, c3 = st.columns(3)
@@ -311,7 +325,5 @@ with tab3:
                 c3.metric("Quantidade de Trades", f"{int(mudancas_posicao)}")
 
                 df_export = hist[['Close', 'RSI', 'EMA_9', 'EMA_21', 'MACD', 'Score_BT', 'Posicao', 'Retorno_Robo']].dropna().round(4)
-                csv_bt = df_export.to_csv().encode('utf-8')
-                st.download_button(label="📥 Baixar Série Histórica Auditável", data=csv_bt, file_name=f'backtest_parametrizado_{ativo_bt}.csv', mime='text/csv')
-            else:
-                st.error("Falha ao puxar dados.")
+                st.download_button(label="📥 Baixar Série Histórica Auditável", data=df_export.to_csv().encode('utf-8'), file_name=f'backtest_parametrizado_{ativo_bt}.csv', mime='text/csv')
+            else: st.error("Falha ao puxar dados.")
