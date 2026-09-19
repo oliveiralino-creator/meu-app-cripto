@@ -16,9 +16,11 @@ v3 (após diagnóstico em SOL 1y):
     em SOL 5y piorou in-sample e fora da amostra — bloqueia os rompimentos que pagam a estratégia.
   * Filtro de regime BTC (MA200): sem posição comprada quando o BTC está abaixo da média longa.
     Em SOL 5y: menos drawdown (−54% → −38%) e 2022 positivo, mas custa retorno fora da amostra
-    (SOL sai do fundo antes do BTC). É um seguro, não um amplificador — opcional.
+    (OOS +226% → +104%; SOL sai do fundo antes do BTC). MA150/100 pioram ainda mais o OOS.
+    É um seguro, não um amplificador — DESLIGADO por padrão.
   * Walk-forward rolante (equity 100% fora da amostra), diagnóstico do sinal por componente e
     teste de permutação (o resultado é distinguível de sorte?).
+  * Padrões = configuração validada; a sidebar salva/carrega parâmetros em parametros.json.
 """
 
 import streamlit as st
@@ -246,10 +248,33 @@ def get_sentiment(news, api_key, model_name):
 # =====================================================================
 DEFAULT_PARAMS = dict(
     rsi_period=14, ema_fast=9, ema_slow=21, ma_long=50, mom_period=10, vol_window=20,
-    w_rsi=0.30, w_trend=0.35, w_mom=0.20, w_vol=0.15,
+    # pesos validados em SOL 5y (permutação p=0,007; walk-forward rolante OOS +226% vs hold +130%)
+    w_rsi=0.10, w_trend=0.35, w_mom=0.20, w_vol=0.35,
     mom_extreme=15.0,   # acima deste % no período, o momentum passa a ser penalizado (esticado)
     rsi_extreme=75.0,   # RSI acima disto marca o ativo como esticado
 )
+DEFAULT_SETTINGS = dict(use_regime=False, regime_ma=200, skip_stretched=False, buy_thr=65, sell_thr=45, fee=0.10)
+PARAMS_FILE = "parametros.json"
+
+
+def load_params():
+    try:
+        with open(PARAMS_FILE) as f:
+            saved = json.load(f)
+        p = {**DEFAULT_PARAMS, **{k: v for k, v in saved.get("params", {}).items() if k in DEFAULT_PARAMS}}
+        s = {**DEFAULT_SETTINGS, **{k: v for k, v in saved.get("settings", {}).items() if k in DEFAULT_SETTINGS}}
+        return p, s, True
+    except Exception:
+        return dict(DEFAULT_PARAMS), dict(DEFAULT_SETTINGS), False
+
+
+def save_params(p, s):
+    try:
+        with open(PARAMS_FILE, "w") as f:
+            json.dump({"params": p, "settings": s}, f, indent=2)
+        return True
+    except Exception:
+        return False
 
 
 def rsi_wilder(close: pd.Series, period: int = 14) -> pd.Series:
@@ -589,31 +614,53 @@ if st.sidebar.button("💾 Salvar watchlist"):
     st.sidebar.success("Salva." if save_watchlist(watchlist) else "Não foi possível gravar o arquivo.")
 
 st.sidebar.divider()
+P0, S0, params_from_file = load_params()
 with st.sidebar.expander("🔧 Parâmetros do motor (radar + backtest)"):
-    P = dict(DEFAULT_PARAMS)
-    P["rsi_period"] = st.slider("Período RSI", 7, 28, P["rsi_period"])
-    P["ema_fast"] = st.slider("EMA rápida", 5, 20, P["ema_fast"])
-    P["ema_slow"] = st.slider("EMA lenta", 15, 60, P["ema_slow"])
-    P["ma_long"] = st.slider("Média longa", 20, 200, P["ma_long"], step=10)
-    P["mom_period"] = st.slider("Período momentum", 3, 30, P["mom_period"])
+    P = dict(P0)
+    P["rsi_period"] = st.slider("Período RSI", 7, 28, int(P["rsi_period"]))
+    P["ema_fast"] = st.slider("EMA rápida", 5, 20, int(P["ema_fast"]))
+    P["ema_slow"] = st.slider("EMA lenta", 15, 60, int(P["ema_slow"]))
+    P["ma_long"] = st.slider("Média longa", 20, 200, int(P["ma_long"]), step=10)
+    P["mom_period"] = st.slider("Período momentum", 3, 30, int(P["mom_period"]))
     st.markdown("**Pesos** (normalizados automaticamente)")
-    w = [st.slider("RSI", 0.0, 1.0, P["w_rsi"], 0.05), st.slider("Tendência", 0.0, 1.0, P["w_trend"], 0.05),
-         st.slider("Momentum", 0.0, 1.0, P["w_mom"], 0.05), st.slider("Risco (volatilidade)", 0.0, 1.0, P["w_vol"], 0.05)]
+    w = [st.slider("RSI", 0.0, 1.0, float(P["w_rsi"]), 0.05), st.slider("Tendência", 0.0, 1.0, float(P["w_trend"]), 0.05),
+         st.slider("Momentum", 0.0, 1.0, float(P["w_mom"]), 0.05),
+         st.slider("Risco (volatilidade)", 0.0, 1.0, float(P["w_vol"]), 0.05)]
     tot = sum(w) or 1.0
-    P["w_rsi"], P["w_trend"], P["w_mom"], P["w_vol"] = [x / tot for x in w]
+    P["w_rsi"], P["w_trend"], P["w_mom"], P["w_vol"] = [round(x / tot, 4) for x in w]
     st.markdown("**Esticado**")
-    P["mom_extreme"] = st.slider("Momentum extremo (%)", 5.0, 40.0, P["mom_extreme"], 1.0,
+    P["mom_extreme"] = st.slider("Momentum extremo (%)", 5.0, 40.0, float(P["mom_extreme"]), 1.0,
                                  help="Acima disto o score de momentum decai e o ativo é marcado como esticado.")
-    P["rsi_extreme"] = st.slider("RSI extremo", 65.0, 90.0, P["rsi_extreme"], 1.0)
+    P["rsi_extreme"] = st.slider("RSI extremo", 65.0, 90.0, float(P["rsi_extreme"]), 1.0)
 
 with st.sidebar.expander("🛡️ Filtros de risco", expanded=True):
-    use_regime = st.toggle("Filtro de regime BTC", value=True,
-                           help="Só permite posição comprada quando o BTC está acima da sua média longa.")
-    regime_ma = st.slider("Média do regime (dias)", 100, 200, 200, 10)
-    skip_stretched = st.toggle("Não comprar esticado", value=False,
+    use_regime = st.toggle("Filtro de regime BTC", value=bool(S0["use_regime"]),
+                           help="Só permite posição comprada quando o BTC está acima da sua média longa. "
+                                "DESLIGADO por padrão: em SOL 5y reduz o drawdown, mas custa ~metade do retorno fora "
+                                "da amostra (SOL sai do fundo antes do BTC). Ligue se preferir menos risco.")
+    regime_ma = st.slider("Média do regime (dias)", 100, 200, int(S0["regime_ma"]), 10,
+                          help="Médias mais curtas pioraram fora da amostra em SOL 5y; 200 é a melhor variante.")
+    skip_stretched = st.toggle("Não comprar esticado", value=bool(S0["skip_stretched"]),
                                help="Bloqueia novas compras quando momentum/RSI estão extremos. DESLIGADO por padrão: em SOL 5y "
                                     "piorou o resultado in-sample e fora da amostra (bloqueia exatamente os rompimentos). "
                                     "O score já penaliza momentum extremo de forma suave.")
+
+st.sidebar.divider()
+st.sidebar.caption(("📂 Parâmetros carregados de `parametros.json`." if params_from_file
+                    else "Usando padrões validados (SOL 5y).") +
+                   " Salve para que sobrevivam ao recarregar o app.")
+if st.sidebar.button("💾 Salvar parâmetros e filtros"):
+    S_now = {"use_regime": use_regime, "regime_ma": regime_ma, "skip_stretched": skip_stretched,
+             "buy_thr": st.session_state.get("bt_buy", S0["buy_thr"]),
+             "sell_thr": st.session_state.get("bt_sell", S0["sell_thr"]),
+             "fee": st.session_state.get("bt_fee", S0["fee"])}
+    st.sidebar.success("Salvo." if save_params(P, S_now) else "Não foi possível gravar o arquivo.")
+if st.sidebar.button("↩️ Restaurar padrões validados"):
+    try:
+        os.remove(PARAMS_FILE)
+    except OSError:
+        pass
+    st.rerun()
 
 if err_cg:
     st.sidebar.error(f"CoinGecko: {err_cg}")
@@ -865,13 +912,13 @@ with tab3:
     if ativo_bt == "Outro...":
         ativo_bt = cA.text_input("Símbolo (ex.: AVAX):", value="AVAX").upper().strip()
     periodo_bt = cB.selectbox("Período:", ["1y", "6mo", "2y", "5y", "max"])
-    fee_bt = cC.number_input("Taxa por operação (%)", 0.0, 2.0, 0.10, 0.05, format="%.2f")
+    fee_bt = cC.number_input("Taxa por operação (%)", 0.0, 2.0, float(S0["fee"]), 0.05, format="%.2f", key="bt_fee")
     train_frac = cD.slider("Fatia de treino (walk-forward simples)", 0.5, 0.9, 0.7, 0.05)
     st.session_state["diag_hz"] = cD.select_slider("Horizonte do diagnóstico (dias)", options=[5, 10, 20], value=10)
 
     s1, s2 = st.columns(2)
-    gatilho_compra = s1.slider("Gatilho de compra (Score ≥):", 50, 90, 65, 5)
-    gatilho_venda = s2.slider("Gatilho de venda (Score ≤):", 20, 60, 45, 5)
+    gatilho_compra = s1.slider("Gatilho de compra (Score ≥):", 50, 90, int(S0["buy_thr"]), 5, key="bt_buy")
+    gatilho_venda = s2.slider("Gatilho de venda (Score ≤):", 20, 60, int(S0["sell_thr"]), 5, key="bt_sell")
     if gatilho_venda >= gatilho_compra:
         st.error("O gatilho de venda precisa ser menor que o de compra.")
 
