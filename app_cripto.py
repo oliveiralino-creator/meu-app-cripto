@@ -10,6 +10,11 @@ Mudanças estruturais em relação à v1:
   * Sentimento por ativo (notícias filtradas por moeda), com cache e saída JSON da IA.
   * Carteira virtual com fechamento de posição e P&L realizado/não realizado.
   * Watchlist persistente, retries com backoff e erros visíveis em vez de tela vazia.
+v3 (após diagnóstico em SOL 1y):
+  * Momentum extremo penalizado + flag "Esticado" (score alto com retorno futuro negativo → não perseguir).
+  * Filtro de regime BTC (MA200): sem posição comprada quando o BTC está abaixo da média longa.
+  * Walk-forward rolante (equity 100% fora da amostra), diagnóstico do sinal por componente e
+    teste de permutação (o resultado é distinguível de sorte?).
 """
 
 import streamlit as st
@@ -407,7 +412,7 @@ def run_backtest(ind: pd.DataFrame, buy_thr: float, sell_thr: float, fee_pct: fl
 
 
 def optimize_walk_forward(ind: pd.DataFrame, buy_grid, sell_grid, fee_pct=0.1, train_frac=0.7,
-                          periods_per_year=365):
+                          periods_per_year=365, **bt_kw):
     """Grid nos gatilhos: escolhe no treino (Sharpe) e reporta o desempenho fora da amostra (teste)."""
     cut = int(len(ind) * train_frac)
     train, test = ind.iloc[:cut], ind.iloc[cut:]
@@ -416,8 +421,8 @@ def optimize_walk_forward(ind: pd.DataFrame, buy_grid, sell_grid, fee_pct=0.1, t
         for s in sell_grid:
             if s >= b:
                 continue
-            _, m_tr, _ = run_backtest(train, b, s, fee_pct, periods_per_year)
-            _, m_te, _ = run_backtest(test, b, s, fee_pct, periods_per_year)
+            _, m_tr, _ = run_backtest(train, b, s, fee_pct, periods_per_year, **bt_kw)
+            _, m_te, _ = run_backtest(test, b, s, fee_pct, periods_per_year, **bt_kw)
             rows.append({"Compra ≥": b, "Venda ≤": s,
                          "Sharpe Treino": m_tr["sharpe_robo"], "Retorno Treino (%)": m_tr["ret_robo"],
                          "Sharpe Teste": m_te["sharpe_robo"], "Retorno Teste (%)": m_te["ret_robo"],
@@ -425,6 +430,80 @@ def optimize_walk_forward(ind: pd.DataFrame, buy_grid, sell_grid, fee_pct=0.1, t
     res = pd.DataFrame(rows).sort_values("Sharpe Treino", ascending=False).reset_index(drop=True)
     _, m_hold_te, _ = run_backtest(test, 101, -1, 0.0, periods_per_year)  # nunca compra → só buy&hold
     return res, m_hold_te, test.index[0]
+
+
+def _sharpe(r: pd.Series, ppy: int = 365) -> float:
+    s = r.std()
+    return float(r.mean() / s * np.sqrt(ppy)) if s and s > 0 else 0.0
+
+
+def rolling_walk_forward(ind: pd.DataFrame, buy_grid, sell_grid, fee_pct=0.1, train_len=252, test_len=63,
+                         periods_per_year=365, **bt_kw):
+    """
+    Walk-forward rolante: em cada janela escolhe (compra, venda) pelo Sharpe no treino e aplica no teste seguinte.
+    Concatena os retornos de teste → curva de equity 100% fora da amostra.
+    Retorna (tabela por janela, série de retornos OOS do robô, série de retornos OOS do hold).
+    """
+    combos = [(b, s) for b in buy_grid for s in sell_grid if s < b]
+    rows, oos_robo, oos_hold = [], [], []
+    start = 0
+    while start + train_len + test_len <= len(ind):
+        train = ind.iloc[start:start + train_len]
+        test = ind.iloc[start + train_len:start + train_len + test_len]
+        best, best_sh = None, -np.inf
+        for b, s in combos:
+            _, m, _ = run_backtest(train, b, s, fee_pct, periods_per_year, **bt_kw)
+            if m["sharpe_robo"] > best_sh:
+                best, best_sh = (b, s), m["sharpe_robo"]
+        res, m_te, _ = run_backtest(test, best[0], best[1], fee_pct, periods_per_year, **bt_kw)
+        oos_robo.append(res["Ret_Robo"]); oos_hold.append(res["Ret"])
+        rows.append({"Janela": len(rows) + 1, "Treino até": train.index[-1], "Teste de": test.index[0],
+                     "Teste até": test.index[-1], "Compra ≥": best[0], "Venda ≤": best[1],
+                     "Sharpe Treino": best_sh, "Retorno Teste (%)": m_te["ret_robo"],
+                     "Hold Teste (%)": m_te["ret_hold"], "Trades": m_te["n_trades"]})
+        start += test_len
+    if not rows:
+        return pd.DataFrame(), pd.Series(dtype=float), pd.Series(dtype=float)
+    return pd.DataFrame(rows), pd.concat(oos_robo), pd.concat(oos_hold)
+
+
+def signal_diagnostics(ind: pd.DataFrame, horizon: int = 10):
+    """Correlação (Spearman) de cada componente com o retorno futuro e retorno médio por faixa de score."""
+    df = ind.copy()
+    df["fwd"] = df["Close"].shift(-horizon) / df["Close"] - 1
+    d = df.dropna(subset=["fwd", "Score"])
+    comps = {"Score": "Score total", "S_RSI": "RSI (contrarian)", "S_TREND": "Tendência",
+             "S_MOM": "Momentum", "S_VOL": "Risco (baixa vol)"}
+    corr = pd.DataFrame([{"Componente": lbl, "Spearman": d[c].corr(d["fwd"], method="spearman"),
+                          "Pearson": d[c].corr(d["fwd"])} for c, lbl in comps.items() if c in d])
+    bins = [0, 35, 45, 55, 65, 75, 100]
+    labels = ["≤35", "35–45", "45–55", "55–65", "65–75", ">75"]
+    by = d.groupby(pd.cut(d["Score"], bins, labels=labels), observed=False)["fwd"].agg(
+        Retorno_medio="mean", Acerto=lambda s: (s > 0).mean(), N="count").reset_index()
+    by.columns = ["Faixa de Score", f"Retorno médio {horizon}d (%)", "% dias positivos", "N"]
+    by[f"Retorno médio {horizon}d (%)"] *= 100
+    by["% dias positivos"] *= 100
+    return corr, by, len(d)
+
+
+def permutation_test(close: pd.Series, p: dict, buy_thr, sell_thr, fee_pct, n_iter=200, seed=0, **bt_kw):
+    """
+    Embaralha os retornos diários (destrói a estrutura temporal, preserva a distribuição), recalcula
+    indicadores e roda o robô. Retorna (Sharpe real, array de Sharpes embaralhados, p-valor).
+    """
+    rng = np.random.default_rng(seed)
+    ind = compute_indicators(close, None, p).dropna(subset=["Score"])
+    _, m_real, _ = run_backtest(ind, buy_thr, sell_thr, fee_pct, **bt_kw)
+    rets = close.pct_change().dropna().values
+    sharpes = []
+    for _ in range(n_iter):
+        shuffled = pd.Series(close.iloc[0] * np.cumprod(1 + rng.permutation(rets)), index=close.index[1:])
+        ind_s = compute_indicators(shuffled, None, p).dropna(subset=["Score"])
+        _, m, _ = run_backtest(ind_s, buy_thr, sell_thr, fee_pct, **bt_kw)
+        sharpes.append(m["sharpe_robo"])
+    sharpes = np.array(sharpes)
+    pval = float((sharpes >= m_real["sharpe_robo"]).mean())
+    return m_real["sharpe_robo"], sharpes, pval
 
 
 # =====================================================================
@@ -518,9 +597,33 @@ with st.sidebar.expander("🔧 Parâmetros do motor (radar + backtest)"):
          st.slider("Momentum", 0.0, 1.0, P["w_mom"], 0.05), st.slider("Risco (volatilidade)", 0.0, 1.0, P["w_vol"], 0.05)]
     tot = sum(w) or 1.0
     P["w_rsi"], P["w_trend"], P["w_mom"], P["w_vol"] = [x / tot for x in w]
+    st.markdown("**Esticado**")
+    P["mom_extreme"] = st.slider("Momentum extremo (%)", 5.0, 40.0, P["mom_extreme"], 1.0,
+                                 help="Acima disto o score de momentum decai e o ativo é marcado como esticado.")
+    P["rsi_extreme"] = st.slider("RSI extremo", 65.0, 90.0, P["rsi_extreme"], 1.0)
+
+with st.sidebar.expander("🛡️ Filtros de risco", expanded=True):
+    use_regime = st.toggle("Filtro de regime BTC", value=True,
+                           help="Só permite posição comprada quando o BTC está acima da sua média longa.")
+    regime_ma = st.slider("Média do regime (dias)", 100, 200, 200, 10)
+    skip_stretched = st.toggle("Não comprar esticado", value=True,
+                               help="Bloqueia novas compras quando momentum/RSI estão extremos; posições abertas são mantidas.")
 
 if err_cg:
     st.sidebar.error(f"CoinGecko: {err_cg}")
+
+# regime do BTC (histórico longo para a MA200 existir desde o início do backtest)
+REGIME = None
+regime_now, regime_err = True, None
+if use_regime:
+    _btc, _miss, regime_err = get_daily_history(("BTC-USD",), "5y")
+    if "BTC-USD" in _btc:
+        REGIME = btc_regime(_btc["BTC-USD"]["Close"], regime_ma)
+        _last = REGIME.dropna()
+        regime_now = bool(_last.iloc[-1]) if len(_last) else True
+    else:
+        regime_err = regime_err or "sem histórico do BTC — filtro de regime desativado nesta sessão"
+BT_KW = {"regime": REGIME, "skip_stretched": skip_stretched}
 
 # =====================================================================
 # 7. ABAS
@@ -535,12 +638,19 @@ with tab1:
     news_geral = get_news("")
     sent_geral, ia_status = get_sentiment(news_geral, ia_key, ia_model)
 
-    c1, c2, c3 = st.columns(3)
+    c1, c2, c3, c4 = st.columns(4)
     c1.metric("Fear & Greed (macro)", f"{fg_value}/100", fg_class)
     c2.metric("Sentimento geral (notícias)", f"{sent_geral}/100", "Positivo" if sent_geral > 50 else "Negativo")
-    c3.info(ia_status)
+    if use_regime and REGIME is not None:
+        c3.metric(f"Regime BTC (MA{regime_ma})", "🟢 Altista" if regime_now else "🔴 Baixista",
+                  "compras liberadas" if regime_now else "compras bloqueadas", delta_color="off")
+    else:
+        c3.metric("Regime BTC", "desligado", regime_err or "", delta_color="off")
+    c4.info(ia_status)
     if err_fg:
         st.caption(f"⚠️ Fear & Greed indisponível ({err_fg}); usando 50.")
+    if use_regime and regime_err:
+        st.caption(f"⚠️ {regime_err}")
     st.divider()
 
     # ---------- Watchlist: análise DIÁRIA com o mesmo motor do backtest ----------
@@ -571,7 +681,10 @@ with tab1:
                 "Var 24h (%)": float(var24h_por_ativo.get(a, np.nan)),
                 "RSI": float(last["RSI"]), "Tendência": float(last["S_TREND"]), "Momentum": float(last["S_MOM"]),
                 "Risco": float(last["S_VOL"]), "Sentimento": sent_a, "Score Técnico": float(last["Score"]),
-                "Score Final": final, "Decisão": classify_action(final), "_news": len(news_a),
+                "Score Final": final, "Esticado": "⚠️" if bool(last["Esticado"]) else "",
+                "Decisão": classify_action(final, bool(last["Esticado"]) and skip_stretched,
+                                           regime_now or not use_regime),
+                "_news": len(news_a),
             })
 
         if rows:
@@ -623,17 +736,19 @@ with tab1:
         st.error("Sem dados do CoinGecko" + (f": {err_cg}" if err_cg else "."))
     else:
         P_H = {**P, "mom_period": 24}
-        techs = []
+        techs, stretched = [], []
         for _, r in df_mkt.iterrows():
             prices = (r.get("sparkline_in_7d") or {}).get("price") or []
             if len(prices) < 60:
-                techs.append(np.nan)
+                techs.append(np.nan); stretched.append(False)
                 continue
-            techs.append(float(compute_indicators(pd.Series(prices), None, P_H)["Score"].iloc[-1]))
+            last_h = compute_indicators(pd.Series(prices), None, P_H).iloc[-1]
+            techs.append(float(last_h["Score"])); stretched.append(bool(last_h["Esticado"]))
         df_mkt["Score Técnico"] = techs
         df_mkt["Score Final"] = df_mkt["Score Técnico"].apply(
             lambda t: np.nan if pd.isna(t) else composite_score(t, sent_geral, fg_value))
-        df_mkt["Decisão"] = df_mkt["Score Final"].apply(classify_action)
+        df_mkt["Decisão"] = [classify_action(s, e and skip_stretched, regime_now or not use_regime)
+                             for s, e in zip(df_mkt["Score Final"], stretched)]
         df_mkt["Vol/Cap (%)"] = (df_mkt["total_volume"] / df_mkt["market_cap"].replace(0, np.nan) * 100).round(2)
 
         filtro = st.multiselect("Filtrar moedas:", options=lista_ativos, default=[])
@@ -745,7 +860,8 @@ with tab3:
         ativo_bt = cA.text_input("Símbolo (ex.: AVAX):", value="AVAX").upper().strip()
     periodo_bt = cB.selectbox("Período:", ["1y", "6mo", "2y", "5y", "max"])
     fee_bt = cC.number_input("Taxa por operação (%)", 0.0, 2.0, 0.10, 0.05, format="%.2f")
-    train_frac = cD.slider("Fatia de treino (walk-forward)", 0.5, 0.9, 0.7, 0.05)
+    train_frac = cD.slider("Fatia de treino (walk-forward simples)", 0.5, 0.9, 0.7, 0.05)
+    st.session_state["diag_hz"] = cD.select_slider("Horizonte do diagnóstico (dias)", options=[5, 10, 20], value=10)
 
     s1, s2 = st.columns(2)
     gatilho_compra = s1.slider("Gatilho de compra (Score ≥):", 50, 90, 65, 5)
@@ -753,11 +869,18 @@ with tab3:
     if gatilho_venda >= gatilho_compra:
         st.error("O gatilho de venda precisa ser menor que o de compra.")
 
-    b1, b2 = st.columns(2)
-    rodar = b1.button("▶️ Rodar simulação", disabled=gatilho_venda >= gatilho_compra)
-    otimizar = b2.button("🧪 Otimizar gatilhos (walk-forward)")
+    filtros_txt = " · ".join(f for f, on in [("regime BTC", use_regime and REGIME is not None),
+                                              ("não comprar esticado", skip_stretched)] if on) or "nenhum"
+    st.caption(f"Filtros ativos (sidebar): **{filtros_txt}**")
 
-    if rodar or otimizar:
+    b1, b2, b3, b4, b5 = st.columns(5)
+    rodar = b1.button("▶️ Rodar simulação", disabled=gatilho_venda >= gatilho_compra)
+    otimizar = b2.button("🧪 Walk-forward simples")
+    rolante = b3.button("🔁 Walk-forward rolante")
+    diagnosticar = b4.button("🩺 Diagnóstico do sinal")
+    permutar = b5.button("🎲 Teste de permutação")
+
+    if rodar or otimizar or rolante or diagnosticar or permutar:
         ticker = f"{ativo_bt}-USD"
         with st.spinner(f"Baixando {ticker}..."):
             hist_map, missing, err_yf = get_daily_history((ticker,), periodo_bt)
@@ -768,12 +891,19 @@ with tab3:
             ind = compute_indicators(h["Close"], h.get("Volume"), P).dropna(subset=["Score"])
 
             if rodar:
-                res, m, trades = run_backtest(ind, gatilho_compra, gatilho_venda, fee_bt)
+                res, m, trades = run_backtest(ind, gatilho_compra, gatilho_venda, fee_bt, **BT_KW)
+                # comparação: mesmo robô sem filtros
+                _, m_raw, _ = run_backtest(ind, gatilho_compra, gatilho_venda, fee_bt)
                 fig = go.Figure()
                 fig.add_trace(go.Scatter(x=res.index, y=(res["Eq_Hold"] - 1) * 100, name="Buy & Hold (%)",
                                          line=dict(color="gray")))
                 fig.add_trace(go.Scatter(x=res.index, y=(res["Eq_Robo"] - 1) * 100, name="Robô (%)",
                                          line=dict(color="green", width=2)))
+                if "Regime" in res:
+                    off = res[~res["Regime"]]
+                    if not off.empty:
+                        fig.add_trace(go.Scatter(x=off.index, y=(off["Eq_Hold"] - 1) * 100, mode="markers",
+                                                 marker=dict(size=3, color="red"), name="BTC em regime baixista"))
                 comprado = res[res["Pos"] == 1]
                 fig.add_trace(go.Scatter(x=comprado.index, y=(comprado["Eq_Robo"] - 1) * 100, mode="markers",
                                          marker=dict(size=3, color="green"), name="Em posição", showlegend=False))
@@ -788,9 +918,15 @@ with tab3:
                 wr = "—" if np.isnan(m["win_rate"]) else f"{m['win_rate']:.0f}%"
                 k4.metric("Trades / win rate", f"{m['n_trades']} / {wr}", f"exposição {m['exposure']:.0f}%",
                           delta_color="off")
-                k5, k6 = st.columns(2)
+                k5, k6, k7 = st.columns(3)
                 k5.metric("CAGR robô", f"{m['cagr_robo']:.1f}%")
                 k6.metric("CAGR hold", f"{m['cagr_hold']:.1f}%")
+                if BT_KW["regime"] is not None or BT_KW["skip_stretched"]:
+                    k7.metric("Sem filtros (Sharpe / retorno)", f"{m_raw['sharpe_robo']:.2f} / {m_raw['ret_robo']:.1f}%",
+                              f"filtros: {m['sharpe_robo'] - m_raw['sharpe_robo']:+.2f} de Sharpe")
+                if m["n_trades"] < 8:
+                    st.warning(f"Apenas {m['n_trades']} trade(s): amostra pequena demais para concluir. "
+                               "Use um período maior, o walk-forward rolante e o teste de permutação.")
 
                 if not trades.empty:
                     with st.expander(f"📋 Trades ({len(trades)})"):
@@ -801,9 +937,10 @@ with tab3:
                                                      "Retorno (%)": "{:.2f}%"})
                                      .background_gradient(subset=["Retorno (%)"], cmap="RdYlGn", vmin=-15, vmax=15),
                                      hide_index=True, **_W)
-                export = res[["Close", "RSI", "EMA_F", "EMA_S", "MACD", "Signal", "MA_L", "Mom", "Vol",
-                              "S_RSI", "S_TREND", "S_MOM", "S_VOL", "Score", "Pos", "Ret_Robo", "Eq_Robo",
-                              "Eq_Hold"]].round(4)
+                exp_cols = ["Close", "RSI", "EMA_F", "EMA_S", "MACD", "Signal", "MA_L", "Mom", "Vol",
+                            "S_RSI", "S_TREND", "S_MOM", "S_VOL", "Score", "Esticado", "Pos", "Ret_Robo",
+                            "Eq_Robo", "Eq_Hold"] + (["Regime"] if "Regime" in res else [])
+                export = res[exp_cols].round(4)
                 st.download_button("📥 Baixar série auditável (CSV)", export.to_csv().encode("utf-8"),
                                    f"backtest_{ativo_bt}_{periodo_bt}.csv", "text/csv")
 
@@ -811,7 +948,7 @@ with tab3:
                 with st.spinner("Rodando grade de gatilhos..."):
                     grid, m_hold, inicio_teste = optimize_walk_forward(
                         ind, buy_grid=range(50, 91, 5), sell_grid=range(20, 61, 5),
-                        fee_pct=fee_bt, train_frac=train_frac)
+                        fee_pct=fee_bt, train_frac=train_frac, **BT_KW)
                 st.markdown(f"**Treino:** até {(inicio_teste - pd.Timedelta(days=1)).strftime('%d/%m/%Y')} · "
                             f"**Teste (fora da amostra):** a partir de {inicio_teste.strftime('%d/%m/%Y')} · "
                             f"Buy & Hold no teste: **{m_hold['ret_hold']:.1f}%** (Sharpe {m_hold['sharpe_hold']:.2f})")
@@ -828,3 +965,91 @@ with tab3:
                                             title="Sharpe fora da amostra por combinação de gatilhos")
                 fig_hm.update_layout(height=380)
                 st.plotly_chart(fig_hm, **_W)
+
+            if rolante:
+                st.markdown("### 🔁 Walk-forward rolante (100% fora da amostra)")
+                st.caption("Treina numa janela, escolhe os gatilhos, aplica no trimestre seguinte e avança. "
+                           "A curva abaixo só usa decisões tomadas sem conhecer o futuro. "
+                           "Gatilhos que mudam muito entre janelas = sinal instável.")
+                train_len, test_len = 252, 63
+                if len(ind) < train_len + 2 * test_len:
+                    st.warning(f"Período curto ({len(ind)} dias) para janelas de {train_len}+{test_len}. "
+                               "Use 2y ou mais; abaixo, janelas reduzidas.")
+                    train_len, test_len = max(90, len(ind) // 3), max(30, len(ind) // 8)
+                with st.spinner("Rodando janelas..."):
+                    tab_wf, oos_r, oos_h = rolling_walk_forward(
+                        ind, range(50, 91, 5), range(20, 61, 5), fee_bt, train_len, test_len, **BT_KW)
+                if tab_wf.empty:
+                    st.error("Dados insuficientes para ao menos uma janela.")
+                else:
+                    eq_r, eq_h = (1 + oos_r).cumprod(), (1 + oos_h).cumprod()
+                    w1, w2, w3, w4 = st.columns(4)
+                    w1.metric("Retorno OOS robô", f"{(eq_r.iloc[-1] - 1) * 100:.1f}%",
+                              f"hold: {(eq_h.iloc[-1] - 1) * 100:.1f}%", delta_color="off")
+                    w2.metric("Sharpe OOS", f"{_sharpe(oos_r):.2f}", f"hold: {_sharpe(oos_h):.2f}", delta_color="off")
+                    w3.metric("DD OOS", f"{(eq_r / eq_r.cummax() - 1).min() * 100:.1f}%")
+                    venceu = (tab_wf["Retorno Teste (%)"] > tab_wf["Hold Teste (%)"]).mean() * 100
+                    w4.metric("Janelas em que bateu o hold", f"{venceu:.0f}%", f"{len(tab_wf)} janelas", delta_color="off")
+                    fig_wf = go.Figure()
+                    fig_wf.add_trace(go.Scatter(x=eq_h.index, y=(eq_h - 1) * 100, name="Hold (OOS)", line=dict(color="gray")))
+                    fig_wf.add_trace(go.Scatter(x=eq_r.index, y=(eq_r - 1) * 100, name="Robô (OOS)", line=dict(color="green", width=2)))
+                    for _, rw in tab_wf.iterrows():
+                        fig_wf.add_vline(x=rw["Teste de"], line_dash="dot", line_color="lightgray")
+                    fig_wf.update_layout(template="plotly_white", height=380, yaxis_title="Retorno acumulado (%)",
+                                         title="Equity fora da amostra, janela a janela")
+                    st.plotly_chart(fig_wf, **_W)
+                    t = tab_wf.copy()
+                    for c in ["Treino até", "Teste de", "Teste até"]:
+                        t[c] = pd.to_datetime(t[c]).dt.strftime("%d/%m/%Y")
+                    st.dataframe(t.style.format({"Sharpe Treino": "{:.2f}", "Retorno Teste (%)": "{:.1f}%",
+                                                 "Hold Teste (%)": "{:.1f}%"})
+                                 .background_gradient(subset=["Retorno Teste (%)"], cmap="RdYlGn", vmin=-30, vmax=30),
+                                 hide_index=True, **_W)
+
+            if diagnosticar:
+                st.markdown("### 🩺 Diagnóstico do sinal")
+                st.caption("O score prevê o retorno futuro? Correlação de cada componente com o retorno dos próximos "
+                           "N dias e retorno médio por faixa de score. Componente com correlação negativa está "
+                           "atrapalhando; faixa alta com retorno negativo = score esticado.")
+                hz = st.session_state.get("diag_hz", 10)
+                corr, by_bucket, n = signal_diagnostics(ind, hz)
+                d1, d2 = st.columns([1, 1])
+                d1.dataframe(corr.style.format({"Spearman": "{:+.3f}", "Pearson": "{:+.3f}"})
+                             .background_gradient(subset=["Spearman"], cmap="RdYlGn", vmin=-0.2, vmax=0.2),
+                             hide_index=True, **_W)
+                d2.dataframe(by_bucket.style.format({f"Retorno médio {hz}d (%)": "{:+.2f}%", "% dias positivos": "{:.0f}%"})
+                             .background_gradient(subset=[f"Retorno médio {hz}d (%)"], cmap="RdYlGn", vmin=-5, vmax=5),
+                             hide_index=True, **_W)
+                fig_b = px.bar(by_bucket, x="Faixa de Score", y=f"Retorno médio {hz}d (%)", template="plotly_white",
+                               title=f"Retorno médio {hz} dias à frente por faixa de score (N={n})",
+                               color=f"Retorno médio {hz}d (%)", color_continuous_scale="RdYlGn")
+                fig_b.update_layout(height=320, coloraxis_showscale=False)
+                st.plotly_chart(fig_b, **_W)
+                pior = corr.sort_values("Spearman").iloc[0]
+                melhor = corr[corr["Componente"] != "Score total"].sort_values("Spearman").iloc[-1]
+                st.info(f"Melhor componente: **{melhor['Componente']}** ({melhor['Spearman']:+.3f}). "
+                        f"Pior: **{pior['Componente']}** ({pior['Spearman']:+.3f}). "
+                        "Correlações abaixo de ~0,05 em módulo são ruído; ajuste os pesos na sidebar e repita "
+                        "em outros ativos e períodos antes de fixar.")
+
+            if permutar:
+                st.markdown("### 🎲 Teste de permutação")
+                st.caption("Embaralha os retornos diários 200 vezes (mesma distribuição, sem estrutura temporal) e "
+                           "roda o robô em cada série. Se o Sharpe real não supera ~95% dos embaralhados, "
+                           "o resultado é indistinguível de sorte.")
+                with st.spinner("Rodando 200 permutações..."):
+                    sh_real, sh_perm, pval = permutation_test(h["Close"], P, gatilho_compra, gatilho_venda, fee_bt,
+                                                              n_iter=200, skip_stretched=skip_stretched)
+                p1, p2, p3 = st.columns(3)
+                p1.metric("Sharpe real", f"{sh_real:.2f}")
+                p2.metric("Sharpe embaralhado (mediana)", f"{np.median(sh_perm):.2f}",
+                          f"p95: {np.percentile(sh_perm, 95):.2f}", delta_color="off")
+                p3.metric("p-valor", f"{pval:.3f}", "há sinal" if pval < 0.05 else "sem evidência",
+                          delta_color="normal" if pval < 0.05 else "inverse")
+                fig_p = px.histogram(x=sh_perm, nbins=30, template="plotly_white",
+                                     labels={"x": "Sharpe em séries embaralhadas"}, title="Distribuição nula")
+                fig_p.add_vline(x=sh_real, line_color="green", line_width=3, annotation_text="real")
+                fig_p.update_layout(height=320, showlegend=False)
+                st.plotly_chart(fig_p, **_W)
+                st.caption("O filtro de regime BTC não entra aqui (o BTC não é embaralhado junto); "
+                           "o teste avalia o score e a regra de esticado.")
