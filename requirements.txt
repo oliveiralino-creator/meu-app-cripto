@@ -1,6 +1,7 @@
 streamlit>=1.40
 pandas
 numpy
+scipy
 requests
 plotly
 feedparser

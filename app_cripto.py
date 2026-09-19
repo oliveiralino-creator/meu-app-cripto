@@ -503,7 +503,8 @@ def signal_diagnostics(ind: pd.DataFrame, horizon: int = 10):
     d = df.dropna(subset=["fwd", "Score"])
     comps = {"Score": "Score total", "S_RSI": "RSI (contrarian)", "S_TREND": "Tendência",
              "S_MOM": "Momentum", "S_VOL": "Risco (baixa vol)"}
-    corr = pd.DataFrame([{"Componente": lbl, "Spearman": d[c].corr(d["fwd"], method="spearman"),
+    fwd_rank = d["fwd"].rank()   # Spearman = Pearson dos ranks (sem depender do scipy)
+    corr = pd.DataFrame([{"Componente": lbl, "Spearman": d[c].rank().corr(fwd_rank),
                           "Pearson": d[c].corr(d["fwd"])} for c, lbl in comps.items() if c in d])
     bins = [0, 35, 45, 55, 65, 75, 100]
     labels = ["≤35", "35–45", "45–55", "55–65", "65–75", ">75"]
