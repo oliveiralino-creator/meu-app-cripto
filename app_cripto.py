@@ -21,6 +21,12 @@ v3 (após diagnóstico em SOL 1y):
   * Walk-forward rolante (equity 100% fora da amostra), diagnóstico do sinal por componente e
     teste de permutação (o resultado é distinguível de sorte?).
   * Padrões = configuração validada; a sidebar salva/carrega parâmetros em parametros.json.
+v3.3 (após BTC/ETH/SOL 5y):
+  * Gatilhos são constantes: re-otimizar (rolante, expansivo) perdeu para 65/45 fixo nos três ativos.
+    O rolante virou teste de robustez e mostra o gatilho fixo como referência no mesmo trecho.
+  * Painel "Veredito por ativo": bateria completa (IS, permutação, OOS fixo, correlação) para vários
+    ativos de uma vez. Resultado até aqui: SOL ✅ (p=0,007), ETH/BTC sem sinal (p≈0,17) — o motor
+    funciona em ativos de beta alto; em BTC/ETH só reduz drawdown.
 """
 
 import streamlit as st
@@ -514,6 +520,37 @@ def signal_diagnostics(ind: pd.DataFrame, horizon: int = 10):
     by[f"Retorno médio {horizon}d (%)"] *= 100
     by["% dias positivos"] *= 100
     return corr, by, len(d)
+
+
+def asset_verdict(close: pd.Series, p: dict, buy_thr=65, sell_thr=45, fee_pct=0.1, oos_start=252, n_perm=100):
+    """
+    Bateria de validação de um ativo com gatilhos FIXOS:
+      in-sample completo, permutação (p-valor), trecho OOS (a partir de oos_start, sem nenhuma otimização)
+      e correlação do score com o retorno de 20 dias. Devolve dict com métricas e um veredito.
+    """
+    ind = compute_indicators(close, None, p).dropna(subset=["Score"])
+    if len(ind) < oos_start + 120:
+        return {"erro": f"histórico curto ({len(ind)} dias)"}
+    _, m_is, _ = run_backtest(ind, buy_thr, sell_thr, fee_pct)
+    _, m_oos, _ = run_backtest(ind.iloc[oos_start:], buy_thr, sell_thr, fee_pct)
+    corr, _, _ = signal_diagnostics(ind, 20)
+    sh_real, perm, pval = permutation_test(close, p, buy_thr, sell_thr, fee_pct, n_iter=n_perm)
+    vol = float(close.pct_change().std() * np.sqrt(365) * 100)
+    sinal = pval < 0.05
+    bate_hold = m_oos["sharpe_robo"] > m_oos["sharpe_hold"] and m_oos["ret_robo"] > m_oos["ret_hold"]
+    protege = m_oos["dd_robo"] > m_oos["dd_hold"] and m_oos["sharpe_robo"] >= m_oos["sharpe_hold"] - 0.05
+    if sinal and bate_hold:
+        veredito = "✅ Sinal real — usar robô"
+    elif protege:
+        veredito = "🛡️ Só reduz drawdown — hold ou robô como freio"
+    else:
+        veredito = "❌ Sem vantagem — hold"
+    return {"Vol anual (%)": vol, "Robô IS (%)": m_is["ret_robo"], "Hold IS (%)": m_is["ret_hold"],
+            "Sharpe IS": m_is["sharpe_robo"], "DD robô (%)": m_is["dd_robo"], "DD hold (%)": m_is["dd_hold"],
+            "Trades": m_is["n_trades"], "Corr 20d": float(corr.iloc[0]["Spearman"]),
+            "p-valor": pval, "Robô OOS (%)": m_oos["ret_robo"], "Hold OOS (%)": m_oos["ret_hold"],
+            "Sharpe OOS": m_oos["sharpe_robo"], "Sharpe hold OOS": m_oos["sharpe_hold"],
+            "Veredito": veredito, "_dias": len(ind)}
 
 
 def permutation_test(close: pd.Series, p: dict, buy_thr, sell_thr, fee_pct, n_iter=200, seed=0, **bt_kw):
@@ -1021,10 +1058,11 @@ with tab3:
                 st.plotly_chart(fig_hm, **_W)
 
             if rolante:
-                st.markdown("### 🔁 Walk-forward rolante (100% fora da amostra)")
+                st.markdown("### 🔁 Walk-forward rolante — teste de robustez (100% fora da amostra)")
                 st.caption("Treina numa janela, escolhe os gatilhos, aplica no trimestre seguinte e avança. "
-                           "A curva abaixo só usa decisões tomadas sem conhecer o futuro. "
-                           "Gatilhos que mudam muito entre janelas = sinal instável.")
+                           "Em BTC, ETH e SOL 5y, re-otimizar gatilhos a cada trimestre PERDEU para o gatilho fixo "
+                           "65/45 — por isso a linha tracejada abaixo mostra o gatilho fixo no mesmo trecho. "
+                           "Use isto para checar robustez, não para escolher gatilhos.")
                 train_len, test_len = 252, 63
                 if len(ind) < train_len + 2 * test_len:
                     st.warning(f"Período curto ({len(ind)} dias) para janelas de {train_len}+{test_len}. "
@@ -1037,16 +1075,28 @@ with tab3:
                     st.error("Dados insuficientes para ao menos uma janela.")
                 else:
                     eq_r, eq_h = (1 + oos_r).cumprod(), (1 + oos_h).cumprod()
+                    # referência: gatilho fixo da tela, aplicado ao mesmo trecho OOS, sem otimização alguma
+                    res_fix, m_fix, _ = run_backtest(ind.loc[oos_r.index[0]:oos_r.index[-1]], gatilho_compra,
+                                                     gatilho_venda, fee_bt, **BT_KW)
                     w1, w2, w3, w4 = st.columns(4)
-                    w1.metric("Retorno OOS robô", f"{(eq_r.iloc[-1] - 1) * 100:.1f}%",
+                    w1.metric("Retorno OOS (re-otimizado)", f"{(eq_r.iloc[-1] - 1) * 100:.1f}%",
                               f"hold: {(eq_h.iloc[-1] - 1) * 100:.1f}%", delta_color="off")
-                    w2.metric("Sharpe OOS", f"{_sharpe(oos_r):.2f}", f"hold: {_sharpe(oos_h):.2f}", delta_color="off")
-                    w3.metric("DD OOS", f"{(eq_r / eq_r.cummax() - 1).min() * 100:.1f}%")
+                    w2.metric("Sharpe OOS (re-otimizado)", f"{_sharpe(oos_r):.2f}", f"hold: {_sharpe(oos_h):.2f}", delta_color="off")
+                    w3.metric(f"Gatilho fixo {gatilho_compra}/{gatilho_venda} no mesmo trecho",
+                              f"{m_fix['ret_robo']:.1f}%", f"Sharpe {m_fix['sharpe_robo']:.2f} · DD {m_fix['dd_robo']:.0f}%",
+                              delta_color="off")
                     venceu = (tab_wf["Retorno Teste (%)"] > tab_wf["Hold Teste (%)"]).mean() * 100
                     w4.metric("Janelas em que bateu o hold", f"{venceu:.0f}%", f"{len(tab_wf)} janelas", delta_color="off")
+                    if m_fix["sharpe_robo"] > _sharpe(oos_r):
+                        st.info("O gatilho fixo superou a re-otimização neste ativo — comportamento esperado; "
+                                "trate os gatilhos como constantes.")
                     fig_wf = go.Figure()
                     fig_wf.add_trace(go.Scatter(x=eq_h.index, y=(eq_h - 1) * 100, name="Hold (OOS)", line=dict(color="gray")))
-                    fig_wf.add_trace(go.Scatter(x=eq_r.index, y=(eq_r - 1) * 100, name="Robô (OOS)", line=dict(color="green", width=2)))
+                    fig_wf.add_trace(go.Scatter(x=eq_r.index, y=(eq_r - 1) * 100, name="Robô re-otimizado (OOS)",
+                                                line=dict(color="green", width=2)))
+                    fig_wf.add_trace(go.Scatter(x=res_fix.index, y=(res_fix["Eq_Robo"] - 1) * 100,
+                                                name=f"Robô gatilho fixo {gatilho_compra}/{gatilho_venda}",
+                                                line=dict(color="darkgreen", width=2, dash="dash")))
                     for _, rw in tab_wf.iterrows():
                         fig_wf.add_vline(x=rw["Teste de"], line_dash="dot", line_color="lightgray")
                     fig_wf.update_layout(template="plotly_white", height=380, yaxis_title="Retorno acumulado (%)",
@@ -1107,3 +1157,57 @@ with tab3:
                 st.plotly_chart(fig_p, **_W)
                 st.caption("O filtro de regime BTC não entra aqui (o BTC não é embaralhado junto); "
                            "o teste avalia o score e a regra de esticado.")
+
+    # ------------------------------------------------------------------
+    # VEREDITO POR ATIVO — bateria completa com gatilho fixo, vários ativos de uma vez
+    # ------------------------------------------------------------------
+    st.divider()
+    st.markdown("### 🏁 Veredito por ativo (gatilho fixo, 5 anos)")
+    st.caption("Para cada ativo: backtest completo, teste de permutação, trecho fora da amostra (a partir do dia 252, "
+               "sem otimização) e correlação do score com o retorno de 20 dias. "
+               "✅ = p<0,05 e bate o hold fora da amostra · 🛡️ = sem sinal, mas reduz drawdown com Sharpe ≥ hold · "
+               "❌ = sem vantagem. Regra observada: quanto maior a volatilidade do ativo, mais o motor funciona "
+               "(SOL ✅, ETH/BTC 🛡️).")
+    v1, v2, v3 = st.columns([3, 1, 1])
+    sugeridos = sorted(set(watchlist) | {"BTC", "ETH", "SOL"})
+    ativos_ver = v1.multiselect("Ativos:", options=sorted(set(sugeridos) | set(lista_ativos)), default=sugeridos,
+                                max_selections=12)
+    extra = v2.text_input("Extras (vírgula):", value="", placeholder="AVAX, LINK, DOGE")
+    n_perm = v3.select_slider("Permutações", options=[50, 100, 200], value=100)
+    ativos_ver = list(dict.fromkeys(ativos_ver + [a.strip().upper() for a in extra.split(",") if a.strip()]))
+    if st.button("🏁 Rodar veredito", disabled=not ativos_ver):
+        tick = tuple(f"{a}-USD" for a in ativos_ver)
+        with st.spinner("Baixando 5 anos..."):
+            hist_v, miss_v, err_v = get_daily_history(tick, "5y")
+        if miss_v:
+            st.caption("Sem histórico: " + ", ".join(m.replace("-USD", "") for m in miss_v))
+        linhas, barra = [], st.progress(0.0)
+        for i, a in enumerate(ativos_ver):
+            t = f"{a}-USD"
+            if t in hist_v:
+                r = asset_verdict(hist_v[t]["Close"], P, gatilho_compra, gatilho_venda, fee_bt, n_perm=n_perm)
+                linhas.append({"Ativo": a, **({"Veredito": r["erro"]} if "erro" in r else r)})
+            barra.progress((i + 1) / len(ativos_ver), text=f"{a} ({i + 1}/{len(ativos_ver)})")
+        barra.empty()
+        if linhas:
+            dv = pd.DataFrame(linhas)
+            cols_v = ["Ativo", "Veredito", "Vol anual (%)", "p-valor", "Corr 20d", "Robô OOS (%)", "Hold OOS (%)",
+                      "Sharpe OOS", "Sharpe hold OOS", "Robô IS (%)", "Hold IS (%)", "DD robô (%)", "DD hold (%)", "Trades"]
+            dv = dv[[c for c in cols_v if c in dv]].sort_values("p-valor") if "p-valor" in dv else dv
+            st.session_state["veredito"] = dv
+    if "veredito" in st.session_state:
+        dv = st.session_state["veredito"]
+        fmt = {"Vol anual (%)": "{:.0f}%", "p-valor": "{:.3f}", "Corr 20d": "{:+.3f}", "Robô OOS (%)": "{:.0f}%",
+               "Hold OOS (%)": "{:.0f}%", "Sharpe OOS": "{:.2f}", "Sharpe hold OOS": "{:.2f}", "Robô IS (%)": "{:.0f}%",
+               "Hold IS (%)": "{:.0f}%", "DD robô (%)": "{:.0f}%", "DD hold (%)": "{:.0f}%"}
+        sty = dv.style.format({k: v for k, v in fmt.items() if k in dv})
+        if "p-valor" in dv:
+            sty = sty.background_gradient(subset=["p-valor"], cmap="RdYlGn_r", vmin=0, vmax=0.3)
+        st.dataframe(sty, hide_index=True, **_W)
+        if "Vol anual (%)" in dv and len(dv) >= 3:
+            fig_v = px.scatter(dv, x="Vol anual (%)", y="p-valor", text="Ativo", template="plotly_white",
+                               title="Sinal × volatilidade (abaixo da linha = sinal estatisticamente real)")
+            fig_v.add_hline(y=0.05, line_dash="dash", line_color="green")
+            fig_v.update_traces(textposition="top center"); fig_v.update_layout(height=340)
+            st.plotly_chart(fig_v, **_W)
+        st.download_button("📥 Baixar veredito (CSV)", dv.to_csv(index=False).encode("utf-8"), "veredito_ativos.csv", "text/csv")
