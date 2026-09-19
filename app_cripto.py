@@ -27,6 +27,11 @@ v3.3 (após BTC/ETH/SOL 5y):
   * Painel "Veredito por ativo": bateria completa (IS, permutação, OOS fixo, correlação) para vários
     ativos de uma vez. Resultado até aqui: SOL ✅ (p=0,007), ETH/BTC sem sinal (p≈0,17) — o motor
     funciona em ativos de beta alto; em BTC/ETH só reduz drawdown.
+v3.5 (após 8 ativos):
+  * 3 de 8 ativos com sinal real (SOL, DOGE, AVAX); vol alta é necessária mas não suficiente — o que importa é
+    ter havido tendência longa, e isso não é previsível. Resposta: aba 🧺 Cesta (peso igual, robô em todos):
+    5y +111% vs −55% do hold, DD −50% vs −85%, OOS Sharpe 0,72 vs 0,47.
+  * Aba 📖 Guia explica cada variável, métrica, teste e filtro.
 """
 
 import streamlit as st
@@ -553,6 +558,52 @@ def asset_verdict(close: pd.Series, p: dict, buy_thr=65, sell_thr=45, fee_pct=0.
             "Veredito": veredito, "_dias": len(ind)}
 
 
+def basket_backtest(hist_map: dict, p: dict, buy_thr=65, sell_thr=45, fee_pct=0.1, oos_start=252, **bt_kw):
+    """
+    Roda o robô em cada ativo e monta uma cesta de peso igual, rebalanceada diariamente.
+    Retorna dict com séries de retorno (robô/hold), tabela por ativo, por ano e estado atual de cada ativo.
+    """
+    R, H, estado, contrib = {}, {}, [], []
+    for t, h in hist_map.items():
+        a = t.replace("-USD", "")
+        ind = compute_indicators(h["Close"], h.get("Volume"), p).dropna(subset=["Score"])
+        if len(ind) < 60:
+            continue
+        res, m, _ = run_backtest(ind, buy_thr, sell_thr, fee_pct, **bt_kw)
+        R[a], H[a] = res["Ret_Robo"], res["Ret"]
+        last = res.iloc[-1]
+        dias_pos = int((res["Pos"].iloc[::-1] != last["Pos"]).values.argmax()) if (res["Pos"] != last["Pos"]).any() else len(res)
+        estado.append({"Ativo": a, "Preço": float(last["Close"]), "Score": float(last["Score"]),
+                       "Posição": "🟢 Comprado" if last["Pos"] == 1 else "⚪ Em caixa", "Há (dias)": dias_pos,
+                       "Esticado": "⚠️" if bool(last["Esticado"]) else "", "RSI": float(last["RSI"]),
+                       "Tendência": float(last["S_TREND"]), "Momentum": float(last["S_MOM"]), "Risco": float(last["S_VOL"])})
+        contrib.append({"Ativo": a, "Robô (%)": m["ret_robo"], "Hold (%)": m["ret_hold"], "DD robô (%)": m["dd_robo"],
+                        "DD hold (%)": m["dd_hold"], "Sharpe robô": m["sharpe_robo"], "Sharpe hold": m["sharpe_hold"],
+                        "Trades": m["n_trades"], "Exposição (%)": m["exposure"]})
+    if not R:
+        return None
+    R, H = pd.DataFrame(R).dropna(), pd.DataFrame(H).dropna()
+    rr, hh = R.mean(axis=1), H.mean(axis=1)
+
+    def _m(r):
+        e = (1 + r).cumprod()
+        return {"ret": (e.iloc[-1] - 1) * 100, "dd": (e / e.cummax() - 1).min() * 100, "sharpe": _sharpe(r), "eq": e}
+    out = {"robo": _m(rr), "hold": _m(hh), "n": len(R.columns), "dias": len(rr)}
+    if len(rr) > oos_start + 60:
+        out["robo_oos"], out["hold_oos"] = _m(rr.iloc[oos_start:]), _m(hh.iloc[oos_start:])
+    # contribuição: retorno médio diário de cada ativo dentro da cesta (já dividido por N)
+    ct = pd.DataFrame(contrib)
+    ct["Contribuição p/ cesta (pp)"] = [((1 + R[a]).prod() - 1) * 100 / len(R.columns) for a in ct["Ativo"]]
+    out["por_ativo"] = ct.sort_values("Contribuição p/ cesta (pp)", ascending=False)
+    yr = pd.DataFrame({"Robô (%)": rr.groupby(rr.index.year).apply(lambda s: ((1 + s).prod() - 1) * 100),
+                       "Hold (%)": hh.groupby(hh.index.year).apply(lambda s: ((1 + s).prod() - 1) * 100)})
+    yr["Exposição média (%)"] = pd.DataFrame({a: (R[a] != 0).astype(float) for a in R}).mean(axis=1).groupby(rr.index.year).mean() * 100
+    out["por_ano"] = yr
+    out["estado"] = pd.DataFrame(estado).sort_values("Score", ascending=False)
+    out["exposicao_hoje"] = float((out["estado"]["Posição"].str.startswith("🟢")).mean() * 100)
+    return out
+
+
 def permutation_test(close: pd.Series, p: dict, buy_thr, sell_thr, fee_pct, n_iter=200, seed=0, **bt_kw):
     """
     Embaralha os retornos diários (destrói a estrutura temporal, preserva a distribuição), recalcula
@@ -719,7 +770,8 @@ BT_KW = {"regime": REGIME, "skip_stretched": skip_stretched}
 # =====================================================================
 # 7. ABAS
 # =====================================================================
-tab1, tab2, tab3, tab4 = st.tabs(["📊 Radar de Mercado", "💼 Simulador de Carteira", "⏪ Backtesting", "📖 Guia"])
+tab1, tab2, tab3, tab5, tab4 = st.tabs(["📊 Radar de Mercado", "💼 Simulador de Carteira", "⏪ Backtesting",
+                                        "🧺 Cesta", "📖 Guia"])
 
 # Textos de ajuda reutilizados nas tabelas (versão curta; a aba Guia tem a completa)
 HELP_RADAR = """
@@ -1248,6 +1300,96 @@ with tab3:
         st.download_button("📥 Baixar veredito (CSV)", dv.to_csv(index=False).encode("utf-8"), "veredito_ativos.csv", "text/csv")
 
 # ---------------------------------------------------------------------
+# ABA 5 — CESTA
+# ---------------------------------------------------------------------
+with tab5:
+    st.subheader("🧺 Cesta — o robô aplicado a vários ativos ao mesmo tempo")
+    st.caption("Conclusão dos testes: não dá para saber de antemão qual altcoin vai ter tendência, mas numa cesta os "
+               "acertos grandes de uns pagam as perdas pequenas dos outros. Peso igual entre os ativos, rebalanceado "
+               "diariamente; capital dos ativos em caixa fica parado. Mesmo motor e gatilhos da aba Backtesting.")
+    CESTA_PADRAO = ["SOL", "AVAX", "DOGE", "ETH", "BTC", "LINK", "ADA", "DOT"]
+    c1, c2, c3 = st.columns([3, 1, 1])
+    opcoes_cesta = sorted(set(CESTA_PADRAO) | set(watchlist) | set(lista_ativos))
+    ativos_cesta = c1.multiselect("Ativos da cesta:", options=opcoes_cesta,
+                                  default=[a for a in CESTA_PADRAO if a in opcoes_cesta], max_selections=15)
+    extra_c = c2.text_input("Extras (vírgula):", value="", key="cesta_extra", placeholder="NEAR, SUI")
+    periodo_c = c3.selectbox("Período:", ["5y", "2y", "1y", "max"], key="cesta_periodo")
+    ativos_cesta = list(dict.fromkeys(ativos_cesta + [a.strip().upper() for a in extra_c.split(",") if a.strip()]))
+    st.caption(f"Gatilhos {S0['buy_thr']}/{S0['sell_thr']} · taxa {S0['fee']:.2f}% · filtros: "
+               + (", ".join(f for f, on in [("regime BTC", use_regime and REGIME is not None),
+                                              ("não comprar esticado", skip_stretched)] if on) or "nenhum")
+               + " — altere na aba Backtesting / sidebar.")
+
+    if st.button("🧺 Rodar cesta", disabled=not ativos_cesta):
+        with st.spinner(f"Baixando {len(ativos_cesta)} ativos..."):
+            hist_c, miss_c, err_c = get_daily_history(tuple(f"{a}-USD" for a in ativos_cesta), periodo_c)
+        if miss_c:
+            st.caption("Sem histórico: " + ", ".join(m.replace("-USD", "") for m in miss_c))
+        with st.spinner("Rodando o robô em cada ativo..."):
+            st.session_state["cesta"] = basket_backtest(hist_c, P, int(S0["buy_thr"]), int(S0["sell_thr"]),
+                                                        float(S0["fee"]), **BT_KW)
+        if st.session_state["cesta"] is None:
+            st.error("Nenhum ativo com histórico suficiente.")
+
+    B = st.session_state.get("cesta")
+    if B:
+        # ---------- hoje ----------
+        st.markdown("### Hoje")
+        h1, h2, h3, h4 = st.columns(4)
+        n_comp = int(B["estado"]["Posição"].str.startswith("🟢").sum())
+        h1.metric("Exposição da cesta", f"{B['exposicao_hoje']:.0f}%", f"{n_comp} de {B['n']} ativos comprados",
+                  delta_color="off")
+        h2.metric("Score médio", f"{B['estado']['Score'].mean():.0f}")
+        h3.metric("Esticados", f"{(B['estado']['Esticado'] == '⚠️').sum()}")
+        h4.metric("Dias no histórico", f"{B['dias']}")
+        st.dataframe(B["estado"].style.format({"Preço": fmt_price, "Score": "{:.0f}", "RSI": "{:.0f}",
+                                               "Tendência": "{:.0f}", "Momentum": "{:.0f}", "Risco": "{:.0f}"})
+                     .background_gradient(subset=["Score"], cmap="RdYlGn", vmin=0, vmax=100), hide_index=True, **_W)
+        st.caption("'Há (dias)' = há quantos dias o robô está nesse estado. Score ≥ gatilho de compra com posição "
+                   "'Em caixa' significa que a compra vale a partir do próximo fechamento.")
+
+        # ---------- desempenho ----------
+        st.markdown("### Desempenho da cesta")
+        k1, k2, k3, k4 = st.columns(4)
+        k1.metric("Retorno robô", f"{B['robo']['ret']:.0f}%", f"hold: {B['hold']['ret']:.0f}%", delta_color="off")
+        k2.metric("Drawdown máx.", f"{B['robo']['dd']:.0f}%", f"hold: {B['hold']['dd']:.0f}%", delta_color="off")
+        k3.metric("Sharpe", f"{B['robo']['sharpe']:.2f}", f"hold: {B['hold']['sharpe']:.2f}", delta_color="off")
+        if "robo_oos" in B:
+            k4.metric("Fora da amostra (dia 252+)", f"{B['robo_oos']['ret']:.0f}% · Sharpe {B['robo_oos']['sharpe']:.2f}",
+                      f"hold: {B['hold_oos']['ret']:.0f}% · Sharpe {B['hold_oos']['sharpe']:.2f}", delta_color="off")
+        fig_c = go.Figure()
+        fig_c.add_trace(go.Scatter(x=B["hold"]["eq"].index, y=(B["hold"]["eq"] - 1) * 100, name="Cesta hold",
+                                   line=dict(color="gray")))
+        fig_c.add_trace(go.Scatter(x=B["robo"]["eq"].index, y=(B["robo"]["eq"] - 1) * 100, name="Cesta robô",
+                                   line=dict(color="green", width=2)))
+        if "robo_oos" in B:
+            fig_c.add_vline(x=B["robo_oos"]["eq"].index[0], line_dash="dash", line_color="orange",
+                            annotation_text="fora da amostra →", annotation_position="top left")
+        fig_c.update_layout(template="plotly_white", height=400, yaxis_title="Retorno acumulado (%)",
+                            title=f"Cesta de {B['n']} ativos — robô vs. hold")
+        st.plotly_chart(fig_c, **_W)
+
+        cA, cB = st.columns([1, 1])
+        with cA:
+            st.markdown("**Por ano**")
+            st.dataframe(B["por_ano"].style.format("{:.0f}%")
+                         .background_gradient(subset=["Robô (%)"], cmap="RdYlGn", vmin=-60, vmax=60), **_W)
+        with cB:
+            st.markdown("**Contribuição por ativo** (pp do retorno da cesta)")
+            st.dataframe(B["por_ativo"].style.format({"Robô (%)": "{:.0f}%", "Hold (%)": "{:.0f}%", "DD robô (%)": "{:.0f}%",
+                                                      "DD hold (%)": "{:.0f}%", "Sharpe robô": "{:.2f}", "Sharpe hold": "{:.2f}",
+                                                      "Exposição (%)": "{:.0f}%", "Contribuição p/ cesta (pp)": "{:+.1f}"})
+                         .background_gradient(subset=["Contribuição p/ cesta (pp)"], cmap="RdYlGn", vmin=-30, vmax=30),
+                         hide_index=True, **_W)
+        piores = B["por_ativo"][B["por_ativo"]["Sharpe robô"] < B["por_ativo"]["Sharpe hold"]]["Ativo"].tolist()
+        if piores:
+            st.info(f"Ativos em que o robô ficou atrás do hold neste período: **{', '.join(piores)}**. "
+                    "Isso é esperado em parte da cesta — o que importa é o agregado.")
+        st.download_button("📥 Baixar resultado da cesta (CSV)",
+                           pd.concat([B["por_ativo"].set_index("Ativo"), B["estado"].set_index("Ativo")], axis=1)
+                           .to_csv().encode("utf-8"), "cesta.csv", "text/csv")
+
+# ---------------------------------------------------------------------
 # ABA 4 — GUIA
 # ---------------------------------------------------------------------
 with tab4:
@@ -1258,8 +1400,40 @@ teria acontecido se você seguisse esse score no passado, e **testa** se esse re
 Nada aqui é recomendação de investimento — é um instrumento de medição, com as limitações descritas no final.
 """)
 
-    g1, g2, g3, g4, g5, g6 = st.tabs(["1. O score", "2. Radar", "3. Backtesting", "4. Os testes de confiança",
-                                      "5. Filtros e parâmetros", "6. O que já foi validado"])
+    g1, g2, g3, g4, g5, g6, g7 = st.tabs(["1. O score", "2. Radar", "3. Backtesting", "4. Os testes de confiança",
+                                          "5. Filtros e parâmetros", "6. O que já foi validado", "7. Cesta"])
+
+    with g7:
+        st.markdown("""
+### Por que uma cesta, e como usar a aba
+
+Os testes em 8 ativos mostraram que o motor **funciona onde há tendências longas** (SOL, DOGE, AVAX) e **não funciona
+onde não há** (ADA, LINK, DOT) — e não existe forma de saber de antemão qual altcoin vai tender nos próximos anos.
+A resposta não é escolher melhor: é **não escolher**. Numa cesta de peso igual, os acertos grandes de dois ou três
+ativos pagam as perdas pequenas dos demais.
+
+| 5 anos, 8 ativos, peso igual | Robô | Hold |
+|---|---|---|
+| Retorno | +111% | −55% |
+| Drawdown máximo | −50% | −85% |
+| Sharpe | 0,61 | 0,13 |
+| **Fora da amostra** (dia 252 em diante) | **+127%, Sharpe 0,72** | +46%, Sharpe 0,47 |
+
+Até a cesta só com os cinco ativos que individualmente reprovaram (ADA, DOGE, LINK, AVAX, DOT) rendeu +56% fora
+da amostra contra −21% do hold.
+
+**Como ler a aba:**
+- **Hoje** — quantos ativos estão comprados (exposição da cesta) e o estado de cada um. Score acima do gatilho com
+  posição "Em caixa" = compra vale a partir do próximo fechamento.
+- **Desempenho** — curva da cesta robô vs. cesta hold; a linha tracejada marca onde começa o trecho fora da amostra.
+- **Por ano** — a cesta robô perde para o hold nos anos de alta explosiva (custo de entrar depois do fundo) e vence
+  com folga nos anos de queda. Se você não aceita ficar atrás em anos como 2023, seguidor de tendência não é para você.
+- **Contribuição** — quanto cada ativo somou ao retorno da cesta. É normal 2–3 ativos concentrarem quase tudo.
+
+**Regras práticas:** peso igual, rebalanceamento pelo menos semanal, não remover um ativo só porque ficou atrás
+do hold num ano (é o comportamento esperado de parte da cesta), e não adicionar ativos com menos de 2 anos de
+histórico — o robô precisa de ciclo completo para ser avaliado.
+""")
 
     with g1:
         st.markdown("""
@@ -1410,10 +1584,17 @@ Resultados com a configuração padrão, 5 anos (out/2021 – set/2026), taxa 0,
 | **SOL** | 93% | +778% / −35% | −54% / −96% | **0,007** | 1,05 / 0,72 | ✅ Sinal real |
 | **ETH** | 69% | +67% / −23% | −50% / −79% | 0,18 | 0,59 / 0,61 | 🛡️ Só reduz drawdown |
 | **BTC** | 51% | +147% / +69% | −65% / −77% | 0,17 | 0,84 / 0,91 | ❌ Sem vantagem |
+| **AVAX** | 94% | +183% / −83% | −62% / −96% | 0,05 | 0,53 / 0,24 | ✅ Sinal real |
+| **DOGE** | 90% | +255% / −63% | −67% / −85% | 0,04 | 0,91 / 0,48 | ✅ Sinal real |
+| **ADA** | 88% | −67% / −89% | −78% / −94% | 0,63 | −0,15 / 0,19 | ❌ Sem vantagem |
+| **LINK** | 86% | −16% / −53% | −71% / −85% | 0,41 | 0,21 / 0,58 | ❌ Sem vantagem |
+| **DOT** | 83% | −30% / −97% | −73% / −99% | 0,17 | 0,12 / −0,20 | 🛡️ Só reduz drawdown |
 
-**Padrão observado:** o motor funciona em ativos de **beta alto** (tendências longas e violentas, onde tendência +
-momentum pagam). Em BTC e ETH ele só reduz drawdown, trocando retorno por tranquilidade. Hipótese ainda com n = 1;
-o painel Veredito com outras altcoins (AVAX, LINK, DOGE…) é o teste que falta.
+**Padrão observado (8 ativos):** volatilidade alta é *necessária* (os três ✅ são os três mais voláteis) mas *não
+suficiente* (ADA, LINK e DOT são voláteis e reprovam). O que separa é ter tido **tendências de meses** no período —
+e isso não é previsível. Três aprovações em oito com p < 0,05 é muito acima do acaso (esperado: 0,4), então o
+sinal é real em geral; só não se sabe *onde* vai aparecer. Daí a aba 🧺 Cesta. Em **todos** os 8 ativos o robô
+teve drawdown menor que o hold.
 
 **Perfil dos trades (SOL):** win rate ~37%, ganho médio +41%, perda média −10%, payoff 4:1. Três ou quatro
 tendências por ciclo pagam dezenas de perdas pequenas. **Isso exige aceitar sequências de 4–5 perdas seguidas** — quem
