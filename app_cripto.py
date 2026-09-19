@@ -11,8 +11,12 @@ Mudanças estruturais em relação à v1:
   * Carteira virtual com fechamento de posição e P&L realizado/não realizado.
   * Watchlist persistente, retries com backoff e erros visíveis em vez de tela vazia.
 v3 (após diagnóstico em SOL 1y):
-  * Momentum extremo penalizado + flag "Esticado" (score alto com retorno futuro negativo → não perseguir).
+  * Momentum extremo penalizado no score (validado: SOL 5y +361% → +778%, permutação p=0,007).
+  * Flag "Esticado" (aviso). O bloqueio de compra "não comprar esticado" existe mas fica DESLIGADO:
+    em SOL 5y piorou in-sample e fora da amostra — bloqueia os rompimentos que pagam a estratégia.
   * Filtro de regime BTC (MA200): sem posição comprada quando o BTC está abaixo da média longa.
+    Em SOL 5y: menos drawdown (−54% → −38%) e 2022 positivo, mas custa retorno fora da amostra
+    (SOL sai do fundo antes do BTC). É um seguro, não um amplificador — opcional.
   * Walk-forward rolante (equity 100% fora da amostra), diagnóstico do sinal por componente e
     teste de permutação (o resultado é distinguível de sorte?).
 """
@@ -606,8 +610,10 @@ with st.sidebar.expander("🛡️ Filtros de risco", expanded=True):
     use_regime = st.toggle("Filtro de regime BTC", value=True,
                            help="Só permite posição comprada quando o BTC está acima da sua média longa.")
     regime_ma = st.slider("Média do regime (dias)", 100, 200, 200, 10)
-    skip_stretched = st.toggle("Não comprar esticado", value=True,
-                               help="Bloqueia novas compras quando momentum/RSI estão extremos; posições abertas são mantidas.")
+    skip_stretched = st.toggle("Não comprar esticado", value=False,
+                               help="Bloqueia novas compras quando momentum/RSI estão extremos. DESLIGADO por padrão: em SOL 5y "
+                                    "piorou o resultado in-sample e fora da amostra (bloqueia exatamente os rompimentos). "
+                                    "O score já penaliza momentum extremo de forma suave.")
 
 if err_cg:
     st.sidebar.error(f"CoinGecko: {err_cg}")
