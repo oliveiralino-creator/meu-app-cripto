@@ -238,6 +238,8 @@ def get_sentiment(news, api_key, model_name):
 DEFAULT_PARAMS = dict(
     rsi_period=14, ema_fast=9, ema_slow=21, ma_long=50, mom_period=10, vol_window=20,
     w_rsi=0.30, w_trend=0.35, w_mom=0.20, w_vol=0.15,
+    mom_extreme=15.0,   # acima deste % no período, o momentum passa a ser penalizado (esticado)
+    rsi_extreme=75.0,   # RSI acima disto marca o ativo como esticado
 )
 
 
@@ -293,8 +295,13 @@ def compute_indicators(close: pd.Series, volume: pd.Series | None = None, p: dic
     trend = trend + np.where(df["MACD"] > df["Signal"], 35.0, 0.0)
     trend = trend + np.where(df["MA_L"].isna(), 15.0, np.where(c > df["MA_L"], 30.0, 0.0))
     df["S_TREND"] = trend
-    # Momentum: variação de -10%..+10% no período → 0..100
-    df["S_MOM"] = ((df["Mom"] + 10) * 5).clip(0, 100)
+    # Momentum: variação de -10%..+10% no período → 0..100; acima de `mom_extreme` o score DECAI
+    # (o diagnóstico em SOL mostrou retorno futuro negativo quando o momentum está esticado)
+    s_mom = ((df["Mom"] + 10) * 5).clip(0, 100)
+    decay = (100 - (df["Mom"] - p["mom_extreme"]) * 5).clip(0, 100)
+    df["S_MOM"] = np.where(df["Mom"] > p["mom_extreme"], np.minimum(s_mom, decay), s_mom)
+    # Esticado: momentum ou RSI extremos → não perseguir a compra
+    df["Esticado"] = (df["Mom"] > p["mom_extreme"]) | (df["RSI"] > p["rsi_extreme"])
     # Risco: menor volatilidade → maior score (desvio de 0% → 100; 10% → 0)
     df["S_VOL"] = (100 - df["Vol"] * 10).clip(0, 100)
 
@@ -308,9 +315,19 @@ def composite_score(tech, sentiment, fg, w_tech=0.70, w_sent=0.15, w_fg=0.15):
     return float(np.clip(w_tech * tech + w_sent * sentiment + w_fg * (100 - fg), 0, 100))
 
 
-def classify_action(score):
+def btc_regime(btc_close: pd.Series, ma: int = 200) -> pd.Series:
+    """True quando BTC fecha acima da sua média longa (regime altista). Só olha para trás."""
+    m = btc_close.rolling(ma, min_periods=ma).mean()
+    return (btc_close > m).where(m.notna())
+
+
+def classify_action(score, esticado=False, regime_ok=True):
     if pd.isna(score):
         return "⚪ Sem dados"
+    if score >= 60 and not regime_ok:
+        return "⏸️ Aguardar (BTC abaixo da MA200)"
+    if score >= 60 and esticado:
+        return "🟠 Esticado — não perseguir"
     if score >= 80: return "🟢 Compra Forte"
     if score >= 60: return "🟢 Compra Média"
     if score >= 51: return "🟡 Compra Fraca"
@@ -324,16 +341,25 @@ def classify_action(score):
 # 4. BACKTEST E OTIMIZAÇÃO WALK-FORWARD
 # =====================================================================
 def run_backtest(ind: pd.DataFrame, buy_thr: float, sell_thr: float, fee_pct: float = 0.1,
-                 periods_per_year: int = 365):
+                 periods_per_year: int = 365, regime: pd.Series | None = None, skip_stretched: bool = False):
     """
     Sinal gerado no fechamento de t, exposição vale a partir de t+1 (shift). Taxa cobrada a cada troca de posição.
+    regime: série booleana (True = pode estar comprado); fora do regime a posição é zerada.
+    skip_stretched: não abre compra quando o ativo está esticado (mas mantém posição já aberta).
     Retorna (DataFrame com equity, dict de métricas, DataFrame de trades).
     """
     df = ind.copy()
+    buy = df["Score"] >= buy_thr
+    if skip_stretched and "Esticado" in df:
+        buy = buy & ~df["Esticado"].fillna(False).astype(bool)
     sig = pd.Series(np.nan, index=df.index, dtype="float64")
-    sig[df["Score"] >= buy_thr] = 1.0
+    sig[buy] = 1.0
     sig[df["Score"] <= sell_thr] = 0.0
     df["Pos"] = sig.ffill().fillna(0.0)
+    if regime is not None:
+        r = regime.reindex(df.index).ffill().fillna(True).astype(bool)   # sem histórico de BTC → não filtra
+        df["Regime"] = r
+        df["Pos"] = df["Pos"].where(r, 0.0)
     df["Ret"] = df["Close"].pct_change().fillna(0.0)
     pos_prev = df["Pos"].shift(1).fillna(0.0)
     switch = (df["Pos"] != pos_prev).astype(float)
