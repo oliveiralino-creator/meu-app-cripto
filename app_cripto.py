@@ -32,6 +32,10 @@ v3.5 (após 8 ativos):
     ter havido tendência longa, e isso não é previsível. Resposta: aba 🧺 Cesta (peso igual, robô em todos):
     5y +111% vs −55% do hold, DD −50% vs −85%, OOS Sharpe 0,72 vs 0,47.
   * Aba 📖 Guia explica cada variável, métrica, teste e filtro.
+v3.6 — sentimento histórico como 5º componente (experimental, peso 0):
+  * build_sentiment_history.py coleta manchetes datadas (GDELT) por ativo/semana e pontua (léxico e/ou Gemini).
+  * O backtest lê sentimento_historico.csv sem look-ahead (semana vale a partir da segunda seguinte) e o botão
+    "🗞️ Testar sentimento" compara com/sem, in-sample, OOS e permutação.
 """
 
 import streamlit as st
@@ -261,9 +265,37 @@ DEFAULT_PARAMS = dict(
     rsi_period=14, ema_fast=9, ema_slow=21, ma_long=50, mom_period=10, vol_window=20,
     # pesos validados em SOL 5y (permutação p=0,007; walk-forward rolante OOS +226% vs hold +130%)
     w_rsi=0.10, w_trend=0.35, w_mom=0.20, w_vol=0.35,
+    w_sent=0.0,         # sentimento histórico de notícias (5º componente) — 0 até ser validado
     mom_extreme=15.0,   # acima deste % no período, o momentum passa a ser penalizado (esticado)
     rsi_extreme=75.0,   # RSI acima disto marca o ativo como esticado
 )
+SENT_FILE = "sentimento_historico.csv"
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def load_sentiment_history(path: str = SENT_FILE, prefer_ai: bool = True):
+    """
+    Lê o CSV gerado por build_sentiment_history.py e devolve {ativo: Series diária 0–100}.
+    Cada linha é uma semana (segunda a domingo). Para não haver look-ahead, o score da semana passa a valer
+    a partir da segunda-feira SEGUINTE e é mantido até a próxima atualização (ffill).
+    """
+    if not os.path.exists(path):
+        return {}, None
+    try:
+        df = pd.read_csv(path)
+        df["data"] = pd.to_datetime(df["data"], utc=True).dt.tz_localize(None).dt.normalize()
+    except Exception as e:
+        return {}, f"não foi possível ler {path}: {e}"
+    out = {}
+    for a, g in df.groupby("ativo"):
+        g = g.sort_values("data")
+        col = "sent_ia" if prefer_ai and "sent_ia" in g and g["sent_ia"].notna().sum() >= 0.5 * len(g) else "sent_lexico"
+        s = pd.Series(g[col].values, index=pd.to_datetime(g["data"]) + pd.Timedelta(days=7)).astype(float)
+        s = s.where(g["n_manchetes"].values >= 3)             # semanas com < 3 manchetes → sem informação
+        daily = s.resample("D").last().ffill(limit=21)         # vale por até 3 semanas sem notícia nova
+        out[a] = {"serie": daily, "fonte": col, "semanas": int(g["n_manchetes"].ge(3).sum()),
+                  "de": g["data"].min().date(), "ate": g["data"].max().date()}
+    return out, None
 DEFAULT_SETTINGS = dict(use_regime=False, regime_ma=200, skip_stretched=False, buy_thr=65, sell_thr=45, fee=0.10)
 PARAMS_FILE = "parametros.json"
 
@@ -310,11 +342,13 @@ def rsi_wilder(close: pd.Series, period: int = 14) -> pd.Series:
     return pd.Series(out, index=close.index)
 
 
-def compute_indicators(close: pd.Series, volume: pd.Series | None = None, p: dict | None = None) -> pd.DataFrame:
+def compute_indicators(close: pd.Series, volume: pd.Series | None = None, p: dict | None = None,
+                       sent: pd.Series | None = None) -> pd.DataFrame:
     """
     Calcula indicadores e o Score técnico (0–100) para QUALQUER série de preços regular
     (diária no backtest e na watchlist; horária no sparkline do radar).
     Todos os indicadores olham apenas para trás → sem look-ahead.
+    sent: série diária 0–100 de sentimento histórico (opcional; entra com peso p["w_sent"]).
     """
     p = {**DEFAULT_PARAMS, **(p or {})}
     df = pd.DataFrame({"Close": pd.Series(close, dtype="float64")})
@@ -350,8 +384,16 @@ def compute_indicators(close: pd.Series, volume: pd.Series | None = None, p: dic
     # Risco: menor volatilidade → maior score (desvio de 0% → 100; 10% → 0)
     df["S_VOL"] = (100 - df["Vol"] * 10).clip(0, 100)
 
-    df["Score"] = (p["w_rsi"] * df["S_RSI"] + p["w_trend"] * df["S_TREND"]
-                   + p["w_mom"] * df["S_MOM"] + p["w_vol"] * df["S_VOL"])
+    score = (p["w_rsi"] * df["S_RSI"] + p["w_trend"] * df["S_TREND"]
+             + p["w_mom"] * df["S_MOM"] + p["w_vol"] * df["S_VOL"])
+    wtot = p["w_rsi"] + p["w_trend"] + p["w_mom"] + p["w_vol"]
+    if sent is not None and p.get("w_sent", 0) > 0:
+        s = pd.Series(sent).reindex(df.index).ffill(limit=21) if isinstance(df.index, pd.DatetimeIndex) else None
+        if s is not None and s.notna().any():
+            df["S_SENT"] = s.fillna(50.0).clip(0, 100)   # sem informação → neutro (50)
+            score = score + p["w_sent"] * df["S_SENT"]
+            wtot += p["w_sent"]
+    df["Score"] = score / (wtot or 1.0)
     return df
 
 
@@ -513,7 +555,7 @@ def signal_diagnostics(ind: pd.DataFrame, horizon: int = 10):
     df["fwd"] = df["Close"].shift(-horizon) / df["Close"] - 1
     d = df.dropna(subset=["fwd", "Score"])
     comps = {"Score": "Score total", "S_RSI": "RSI (contrarian)", "S_TREND": "Tendência",
-             "S_MOM": "Momentum", "S_VOL": "Risco (baixa vol)"}
+             "S_MOM": "Momentum", "S_VOL": "Risco (baixa vol)", "S_SENT": "Sentimento (notícias)"}
     fwd_rank = d["fwd"].rank()   # Spearman = Pearson dos ranks (sem depender do scipy)
     corr = pd.DataFrame([{"Componente": lbl, "Spearman": d[c].rank().corr(fwd_rank),
                           "Pearson": d[c].corr(d["fwd"])} for c, lbl in comps.items() if c in d])
@@ -527,19 +569,19 @@ def signal_diagnostics(ind: pd.DataFrame, horizon: int = 10):
     return corr, by, len(d)
 
 
-def asset_verdict(close: pd.Series, p: dict, buy_thr=65, sell_thr=45, fee_pct=0.1, oos_start=252, n_perm=100):
+def asset_verdict(close: pd.Series, p: dict, buy_thr=65, sell_thr=45, fee_pct=0.1, oos_start=252, n_perm=100, sent=None):
     """
     Bateria de validação de um ativo com gatilhos FIXOS:
       in-sample completo, permutação (p-valor), trecho OOS (a partir de oos_start, sem nenhuma otimização)
       e correlação do score com o retorno de 20 dias. Devolve dict com métricas e um veredito.
     """
-    ind = compute_indicators(close, None, p).dropna(subset=["Score"])
+    ind = compute_indicators(close, None, p, sent).dropna(subset=["Score"])
     if len(ind) < oos_start + 120:
         return {"erro": f"histórico curto ({len(ind)} dias)"}
     _, m_is, _ = run_backtest(ind, buy_thr, sell_thr, fee_pct)
     _, m_oos, _ = run_backtest(ind.iloc[oos_start:], buy_thr, sell_thr, fee_pct)
     corr, _, _ = signal_diagnostics(ind, 20)
-    sh_real, perm, pval = permutation_test(close, p, buy_thr, sell_thr, fee_pct, n_iter=n_perm)
+    sh_real, perm, pval = permutation_test(close, p, buy_thr, sell_thr, fee_pct, n_iter=n_perm, sent=sent)
     vol = float(close.pct_change().std() * np.sqrt(365) * 100)
     sinal = pval < 0.05
     bate_hold = m_oos["sharpe_robo"] > m_oos["sharpe_hold"] and m_oos["ret_robo"] > m_oos["ret_hold"]
@@ -558,7 +600,7 @@ def asset_verdict(close: pd.Series, p: dict, buy_thr=65, sell_thr=45, fee_pct=0.
             "Veredito": veredito, "_dias": len(ind)}
 
 
-def basket_backtest(hist_map: dict, p: dict, buy_thr=65, sell_thr=45, fee_pct=0.1, oos_start=252, **bt_kw):
+def basket_backtest(hist_map: dict, p: dict, buy_thr=65, sell_thr=45, fee_pct=0.1, oos_start=252, sent_map=None, **bt_kw):
     """
     Roda o robô em cada ativo e monta uma cesta de peso igual, rebalanceada diariamente.
     Retorna dict com séries de retorno (robô/hold), tabela por ativo, por ano e estado atual de cada ativo.
@@ -566,7 +608,7 @@ def basket_backtest(hist_map: dict, p: dict, buy_thr=65, sell_thr=45, fee_pct=0.
     R, H, estado, contrib = {}, {}, [], []
     for t, h in hist_map.items():
         a = t.replace("-USD", "")
-        ind = compute_indicators(h["Close"], h.get("Volume"), p).dropna(subset=["Score"])
+        ind = compute_indicators(h["Close"], h.get("Volume"), p, (sent_map or {}).get(a)).dropna(subset=["Score"])
         if len(ind) < 60:
             continue
         res, m, _ = run_backtest(ind, buy_thr, sell_thr, fee_pct, **bt_kw)
@@ -604,19 +646,19 @@ def basket_backtest(hist_map: dict, p: dict, buy_thr=65, sell_thr=45, fee_pct=0.
     return out
 
 
-def permutation_test(close: pd.Series, p: dict, buy_thr, sell_thr, fee_pct, n_iter=200, seed=0, **bt_kw):
+def permutation_test(close: pd.Series, p: dict, buy_thr, sell_thr, fee_pct, n_iter=200, seed=0, sent=None, **bt_kw):
     """
     Embaralha os retornos diários (destrói a estrutura temporal, preserva a distribuição), recalcula
     indicadores e roda o robô. Retorna (Sharpe real, array de Sharpes embaralhados, p-valor).
     """
     rng = np.random.default_rng(seed)
-    ind = compute_indicators(close, None, p).dropna(subset=["Score"])
+    ind = compute_indicators(close, None, p, sent).dropna(subset=["Score"])
     _, m_real, _ = run_backtest(ind, buy_thr, sell_thr, fee_pct, **bt_kw)
     rets = close.pct_change().dropna().values
     sharpes = []
     for _ in range(n_iter):
         shuffled = pd.Series(close.iloc[0] * np.cumprod(1 + rng.permutation(rets)), index=close.index[1:])
-        ind_s = compute_indicators(shuffled, None, p).dropna(subset=["Score"])
+        ind_s = compute_indicators(shuffled, None, p, sent).dropna(subset=["Score"])
         _, m, _ = run_backtest(ind_s, buy_thr, sell_thr, fee_pct, **bt_kw)
         sharpes.append(m["sharpe_robo"])
     sharpes = np.array(sharpes)
@@ -714,9 +756,12 @@ with st.sidebar.expander("🔧 Parâmetros do motor (radar + backtest)"):
     st.markdown("**Pesos** (normalizados automaticamente)")
     w = [st.slider("RSI", 0.0, 1.0, float(P["w_rsi"]), 0.05), st.slider("Tendência", 0.0, 1.0, float(P["w_trend"]), 0.05),
          st.slider("Momentum", 0.0, 1.0, float(P["w_mom"]), 0.05),
-         st.slider("Risco (volatilidade)", 0.0, 1.0, float(P["w_vol"]), 0.05)]
+         st.slider("Risco (volatilidade)", 0.0, 1.0, float(P["w_vol"]), 0.05),
+         st.slider("Sentimento histórico (notícias)", 0.0, 1.0, float(P.get("w_sent", 0.0)), 0.05,
+                   help="Só tem efeito no backtest e se existir sentimento_historico.csv (gerado por "
+                        "build_sentiment_history.py). Padrão 0 até ser validado.")]
     tot = sum(w) or 1.0
-    P["w_rsi"], P["w_trend"], P["w_mom"], P["w_vol"] = [round(x / tot, 4) for x in w]
+    P["w_rsi"], P["w_trend"], P["w_mom"], P["w_vol"], P["w_sent"] = [round(x / tot, 4) for x in w]
     st.markdown("**Esticado**")
     P["mom_extreme"] = st.slider("Momentum extremo (%)", 5.0, 40.0, float(P["mom_extreme"]), 1.0,
                                  help="Acima disto o score de momentum decai e o ativo é marcado como esticado.")
@@ -766,6 +811,8 @@ if use_regime:
     else:
         regime_err = regime_err or "sem histórico do BTC — filtro de regime desativado nesta sessão"
 BT_KW = {"regime": REGIME, "skip_stretched": skip_stretched}
+SENT_HIST, sent_err = load_sentiment_history()
+SENT_MAP = {a: v["serie"] for a, v in SENT_HIST.items()}
 
 # =====================================================================
 # 7. ABAS
@@ -1049,14 +1096,29 @@ with tab3:
                                               ("não comprar esticado", skip_stretched)] if on) or "nenhum"
     st.caption(f"Filtros ativos (sidebar): **{filtros_txt}**")
 
-    b1, b2, b3, b4, b5 = st.columns(5)
+    if sent_err:
+        st.warning(sent_err)
+    sent_bt = SENT_MAP.get(ativo_bt)
+    if ativo_bt in SENT_HIST:
+        i = SENT_HIST[ativo_bt]
+        st.caption(f"🗞️ Sentimento histórico disponível para {ativo_bt}: {i['semanas']} semanas com notícias "
+                   f"({i['de']} → {i['ate']}), fonte `{i['fonte']}`. Peso atual no score: {P.get('w_sent', 0):.2f}.")
+    elif SENT_HIST:
+        st.caption(f"🗞️ Sentimento histórico existe, mas não para {ativo_bt}. Ativos cobertos: "
+                   + ", ".join(sorted(SENT_HIST)))
+    else:
+        st.caption("🗞️ Sem sentimento histórico. Gere com `python build_sentiment_history.py --ativos SOL,BTC,...` "
+                   "e coloque o CSV na pasta do app para testar o sentimento como componente do score.")
+
+    b1, b2, b3, b4, b5, b6 = st.columns(6)
     rodar = b1.button("▶️ Rodar simulação", disabled=gatilho_venda >= gatilho_compra)
     otimizar = b2.button("🧪 Walk-forward simples")
     rolante = b3.button("🔁 Walk-forward rolante")
     diagnosticar = b4.button("🩺 Diagnóstico do sinal")
     permutar = b5.button("🎲 Teste de permutação")
+    testar_sent = b6.button("🗞️ Testar sentimento", disabled=sent_bt is None)
 
-    if rodar or otimizar or rolante or diagnosticar or permutar:
+    if rodar or otimizar or rolante or diagnosticar or permutar or testar_sent:
         ticker = f"{ativo_bt}-USD"
         with st.spinner(f"Baixando {ticker}..."):
             hist_map, missing, err_yf = get_daily_history((ticker,), periodo_bt)
@@ -1064,7 +1126,7 @@ with tab3:
             st.error(f"Sem dados para {ticker}" + (f": {err_yf}" if err_yf else " (ticker inexistente no yfinance?)"))
         else:
             h = hist_map[ticker]
-            ind = compute_indicators(h["Close"], h.get("Volume"), P).dropna(subset=["Score"])
+            ind = compute_indicators(h["Close"], h.get("Volume"), P, sent_bt).dropna(subset=["Score"])
 
             if rodar:
                 res, m, trades = run_backtest(ind, gatilho_compra, gatilho_venda, fee_bt, **BT_KW)
@@ -1230,7 +1292,7 @@ with tab3:
                            "o resultado é indistinguível de sorte.")
                 with st.spinner("Rodando 200 permutações..."):
                     sh_real, sh_perm, pval = permutation_test(h["Close"], P, gatilho_compra, gatilho_venda, fee_bt,
-                                                              n_iter=200, skip_stretched=skip_stretched)
+                                                              n_iter=200, sent=sent_bt, skip_stretched=skip_stretched)
                 p1, p2, p3 = st.columns(3)
                 p1.metric("Sharpe real", f"{sh_real:.2f}")
                 p2.metric("Sharpe embaralhado (mediana)", f"{np.median(sh_perm):.2f}",
@@ -1244,6 +1306,50 @@ with tab3:
                 st.plotly_chart(fig_p, **_W)
                 st.caption("O filtro de regime BTC não entra aqui (o BTC não é embaralhado junto); "
                            "o teste avalia o score e a regra de esticado.")
+
+            if testar_sent:
+                st.markdown("### 🗞️ O sentimento das notícias ajuda o robô?")
+                st.caption("Mesma série, mesmos gatilhos: score sem sentimento vs. score com sentimento (peso 0,25, os "
+                           "demais reescalados). O sentimento de cada semana só vale a partir da segunda-feira seguinte "
+                           "(sem look-ahead). Permutação com 150 embaralhamentos em cada caso.")
+                P0s = {**P, "w_sent": 0.0}
+                P1s = {**P, "w_sent": 0.25}
+                ind0 = compute_indicators(h["Close"], None, P0s).dropna(subset=["Score"])
+                ind1 = compute_indicators(h["Close"], None, P1s, sent_bt).dropna(subset=["Score"])
+                if "S_SENT" not in ind1:
+                    st.error("O sentimento não cobre o período deste backtest.")
+                else:
+                    cobertura = float(sent_bt.reindex(ind1.index).notna().mean() * 100)
+                    st.caption(f"Cobertura do sentimento no período: {cobertura:.0f}% dos dias.")
+                    with st.spinner("Rodando com e sem sentimento..."):
+                        _, m0, _ = run_backtest(ind0, gatilho_compra, gatilho_venda, fee_bt, **BT_KW)
+                        _, m1, _ = run_backtest(ind1, gatilho_compra, gatilho_venda, fee_bt, **BT_KW)
+                        _, o0, _ = run_backtest(ind0.iloc[252:], gatilho_compra, gatilho_venda, fee_bt, **BT_KW)
+                        _, o1, _ = run_backtest(ind1.iloc[252:], gatilho_compra, gatilho_venda, fee_bt, **BT_KW)
+                        _, _, p0 = permutation_test(h["Close"], P0s, gatilho_compra, gatilho_venda, fee_bt, n_iter=150,
+                                                    skip_stretched=skip_stretched)
+                        _, _, p1 = permutation_test(h["Close"], P1s, gatilho_compra, gatilho_venda, fee_bt, n_iter=150,
+                                                    sent=sent_bt, skip_stretched=skip_stretched)
+                        corr1, by1, _ = signal_diagnostics(ind1, 20)
+                    comp = pd.DataFrame({
+                        "Sem sentimento": [m0["ret_robo"], m0["dd_robo"], m0["sharpe_robo"], m0["n_trades"], o0["ret_robo"], o0["sharpe_robo"], p0],
+                        "Com sentimento (0,25)": [m1["ret_robo"], m1["dd_robo"], m1["sharpe_robo"], m1["n_trades"], o1["ret_robo"], o1["sharpe_robo"], p1],
+                    }, index=["Retorno (%)", "Drawdown (%)", "Sharpe", "Trades", "Retorno OOS (%)", "Sharpe OOS", "p-valor"])
+                    st.dataframe(comp.style.format("{:.2f}"), **_W)
+                    rs = corr1[corr1["Componente"] == "Sentimento (notícias)"]
+                    if len(rs):
+                        cs = float(rs["Spearman"].iloc[0])
+                        st.metric("Correlação do sentimento com o retorno de 20 dias", f"{cs:+.3f}",
+                                  "sinal relevante" if abs(cs) >= 0.05 else "ruído", delta_color="normal" if cs >= 0.05 else "inverse")
+                    melhor = (o1["sharpe_robo"] > o0["sharpe_robo"]) and (p1 <= p0)
+                    if melhor:
+                        st.success("O sentimento melhorou o Sharpe fora da amostra sem piorar o p-valor. "
+                                   "Repita em outros ativos antes de subir o peso na sidebar.")
+                    else:
+                        st.warning("O sentimento não melhorou o resultado fora da amostra neste ativo. "
+                                   "Mantenha o peso em 0 — o Score Final do radar continua usando sentimento ao vivo "
+                                   "apenas como informação, não como sinal validado.")
+                    st.dataframe(corr1.style.format({"Spearman": "{:+.3f}", "Pearson": "{:+.3f}"}), hide_index=True, **_W)
 
     # ------------------------------------------------------------------
     # VEREDITO POR ATIVO — bateria completa com gatilho fixo, vários ativos de uma vez
@@ -1272,7 +1378,8 @@ with tab3:
         for i, a in enumerate(ativos_ver):
             t = f"{a}-USD"
             if t in hist_v:
-                r = asset_verdict(hist_v[t]["Close"], P, gatilho_compra, gatilho_venda, fee_bt, n_perm=n_perm)
+                r = asset_verdict(hist_v[t]["Close"], P, gatilho_compra, gatilho_venda, fee_bt, n_perm=n_perm,
+                                  sent=SENT_MAP.get(a))
                 linhas.append({"Ativo": a, **({"Veredito": r["erro"]} if "erro" in r else r)})
             barra.progress((i + 1) / len(ativos_ver), text=f"{a} ({i + 1}/{len(ativos_ver)})")
         barra.empty()
@@ -1327,7 +1434,7 @@ with tab5:
             st.caption("Sem histórico: " + ", ".join(m.replace("-USD", "") for m in miss_c))
         with st.spinner("Rodando o robô em cada ativo..."):
             st.session_state["cesta"] = basket_backtest(hist_c, P, int(S0["buy_thr"]), int(S0["sell_thr"]),
-                                                        float(S0["fee"]), **BT_KW)
+                                                        float(S0["fee"]), sent_map=SENT_MAP, **BT_KW)
         if st.session_state["cesta"] is None:
             st.error("Nenhum ativo com histórico suficiente.")
 
@@ -1571,6 +1678,28 @@ exige rodar de novo permutação e OOS. Os pesos são normalizados automaticamen
 parecido, e re-otimizar a cada trimestre piora. Trate como constante.
 
 **Taxa por operação** — 0,10% cobre corretagem típica de exchange + um pouco de slippage. Cobrada na entrada e na saída.
+
+### Sentimento histórico de notícias (5º componente, experimental)
+
+O Radar usa o sentimento das notícias **de hoje** como informação. Para saber se sentimento **prevê** alguma coisa, é
+preciso um histórico datado — e é isso que o script `build_sentiment_history.py` constrói:
+
+1. Para cada ativo e cada semana dos últimos 5 anos, busca manchetes datadas no GDELT (base pública de notícias).
+2. Pontua a semana de 0 a 100 com o léxico e, opcionalmente (`--ai`), com o Gemini.
+3. Salva em `sentimento_historico.csv`, retomável (pode rodar em várias sessões).
+
+Com o CSV na pasta do app, o backtest ganha o botão **🗞️ Testar sentimento**: roda o mesmo ativo sem e com o
+componente (peso 0,25), compara retorno, Sharpe, fora da amostra e p-valor, e mostra a correlação do sentimento com o
+retorno de 20 dias. **Sem look-ahead:** o score de uma semana só vale a partir da segunda-feira seguinte.
+
+O peso padrão é **0**. Só suba se o teste melhorar o Sharpe fora da amostra sem piorar o p-valor, em mais de um ativo.
+Se não melhorar — hipótese mais provável —, a conclusão também vale: o sentimento das manchetes fica como contexto
+no Radar, não como sinal.
+
+```
+python build_sentiment_history.py --ativos SOL,BTC,ETH,DOGE,AVAX --anos 5
+python build_sentiment_history.py --ativos SOL --anos 5 --ai        # requer GEMINI_API_KEY no ambiente
+```
 """)
 
     with g6:
