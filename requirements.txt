@@ -1,9 +1,8 @@
-streamlit
+streamlit>=1.40
 pandas
+numpy
 requests
 plotly
-numpy
 feedparser
-matplotlib
-google-generativeai
 yfinance
+google-genai
