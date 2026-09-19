@@ -719,7 +719,36 @@ BT_KW = {"regime": REGIME, "skip_stretched": skip_stretched}
 # =====================================================================
 # 7. ABAS
 # =====================================================================
-tab1, tab2, tab3 = st.tabs(["📊 Radar de Mercado", "💼 Simulador de Carteira", "⏪ Backtesting"])
+tab1, tab2, tab3, tab4 = st.tabs(["📊 Radar de Mercado", "💼 Simulador de Carteira", "⏪ Backtesting", "📖 Guia"])
+
+# Textos de ajuda reutilizados nas tabelas (versão curta; a aba Guia tem a completa)
+HELP_RADAR = """
+| Coluna | O que é | Como ler |
+|---|---|---|
+| **RSI** | Índice de força relativa (14 dias): mede se o ativo subiu "demais" ou caiu "demais" recentemente. 0–100. | < 30 sobrevendido, > 70 sobrecomprado. |
+| **Tendência** | 0–100. Soma de três checagens: média rápida acima da lenta (35 pts), MACD acima do sinal (35), preço acima da média de 50 dias (30). | 100 = todas as três apontam alta; 0 = nenhuma. |
+| **Momentum** | 0–100. Variação dos últimos 10 dias (−10% → 0, +10% → 100). Acima de +15% o valor **decai**: alta rápida demais = esticado. | Alto é bom até certo ponto; ⚠️ Esticado avisa quando passou. |
+| **Risco** | 0–100. Quanto **menor** a volatilidade dos últimos 20 dias, maior o valor. | Alto = ativo calmo; baixo = ativo nervoso. |
+| **Sentimento** | 0–100 a partir das manchetes recentes do ativo (ou gerais, se houver poucas). 50 = neutro. | Pesa pouco no score final (15%). |
+| **Score Técnico** | Média ponderada de RSI, Tendência, Momentum e Risco com os pesos da sidebar. | É o número validado pelo backtesting. |
+| **Score Final** | 70% Score Técnico + 15% Sentimento + 15% Fear & Greed invertido (medo extremo soma pontos). | Base da coluna Decisão. |
+| **Esticado ⚠️** | Momentum > 15% em 10 dias ou RSI > 75. | Aviso: alta forte recente; historicamente o retorno seguinte é pior. |
+| **Decisão** | ≥ 80 Compra Forte · 60–79 Compra Média · 51–59 Compra Fraca · 45–50 Neutro · 41–44 Venda Fraca · 21–40 Venda Média · ≤ 20 Venda Forte. | No backtest, o robô compra com score ≥ 65 e vende com ≤ 45. |
+"""
+HELP_BACKTEST = """
+| Métrica | O que é | Como ler |
+|---|---|---|
+| **Retorno robô / hold** | Quanto rendeu seguir o robô vs. comprar no início e segurar. | O robô precisa vencer o hold **e** com menos risco para valer a pena. |
+| **Drawdown máx.** | Maior queda do pico ao vale ao longo do período. | −50% significa que em algum momento você viu metade do capital sumir. |
+| **Sharpe (anual.)** | Retorno por unidade de risco. | < 0,5 fraco · 0,5–1 razoável · > 1 bom. Compare sempre com o Sharpe do hold. |
+| **CAGR** | Retorno composto por ano. | Permite comparar períodos de tamanhos diferentes. |
+| **Trades / win rate** | Nº de operações completas e % delas com lucro. | Seguidores de tendência têm win rate baixo (30–45%) e ganhos grandes: normal. |
+| **Payoff** | Ganho médio dos trades vencedores ÷ perda média dos perdedores. | > 2 compensa win rate baixo. |
+| **Exposição** | % do tempo em que o robô esteve comprado. | O restante do tempo o capital ficou parado (em caixa). |
+| **p-valor (permutação)** | Probabilidade de obter o mesmo Sharpe por sorte, em séries embaralhadas. | < 0,05 = há sinal real. > 0,10 = indistinguível de sorte. |
+| **OOS / fora da amostra** | Resultado em dados que não foram usados para escolher nada. | É o único número que aproxima o que esperar no futuro. |
+| **Corr 20d** | Correlação (Spearman) entre o score de hoje e o retorno dos 20 dias seguintes. | > 0,08 já é relevante em finanças; ≈ 0 = o score não antecipa nada. |
+"""
 
 # ---------------------------------------------------------------------
 # ABA 1 — RADAR
@@ -787,6 +816,10 @@ with tab1:
                          "Score Técnico": "{:.0f}", "Score Final": "{:.0f}"})
                 .background_gradient(subset=["Score Final"], cmap="RdYlGn", vmin=0, vmax=100),
                 hide_index=True, **_W)
+
+            with st.expander("❓ O que significa cada coluna"):
+                st.markdown(HELP_RADAR)
+                st.caption("Explicação completa, com exemplos, na aba 📖 Guia.")
 
             col_g1, col_g2 = st.columns([3, 1])
             base100 = col_g2.toggle("Normalizar (base 100)", value=len(ind_map) > 1)
@@ -1018,6 +1051,8 @@ with tab3:
                 if m["n_trades"] < 8:
                     st.warning(f"Apenas {m['n_trades']} trade(s): amostra pequena demais para concluir. "
                                "Use um período maior, o walk-forward rolante e o teste de permutação.")
+                with st.expander("❓ O que significa cada métrica"):
+                    st.markdown(HELP_BACKTEST)
 
                 if not trades.empty:
                     with st.expander(f"📋 Trades ({len(trades)})"):
@@ -1211,3 +1246,189 @@ with tab3:
             fig_v.update_traces(textposition="top center"); fig_v.update_layout(height=340)
             st.plotly_chart(fig_v, **_W)
         st.download_button("📥 Baixar veredito (CSV)", dv.to_csv(index=False).encode("utf-8"), "veredito_ativos.csv", "text/csv")
+
+# ---------------------------------------------------------------------
+# ABA 4 — GUIA
+# ---------------------------------------------------------------------
+with tab4:
+    st.title("📖 Guia da ferramenta")
+    st.markdown("""
+Este app faz três coisas: **mede** o estado técnico de criptomoedas com um score de 0 a 100, **simula** o que
+teria acontecido se você seguisse esse score no passado, e **testa** se esse resultado é confiável ou sorte.
+Nada aqui é recomendação de investimento — é um instrumento de medição, com as limitações descritas no final.
+""")
+
+    g1, g2, g3, g4, g5, g6 = st.tabs(["1. O score", "2. Radar", "3. Backtesting", "4. Os testes de confiança",
+                                      "5. Filtros e parâmetros", "6. O que já foi validado"])
+
+    with g1:
+        st.markdown("""
+### Como o score é construído
+
+O **Score Técnico** é uma média ponderada de quatro componentes, cada um de 0 a 100. Os pesos padrão
+(RSI 10% · Tendência 35% · Momentum 20% · Risco 35%) foram os que passaram nos testes de confiança em 5 anos de SOL.
+
+| Componente | Pergunta que responde | Cálculo | Leitura |
+|---|---|---|---|
+| **RSI (contrarian)** | O ativo caiu demais recentemente? | RSI de 14 dias invertido: RSI 30 → 100 pontos; RSI 70 → 0 pontos. | Pontua o **sobrevendido**. Peso pequeno: sozinho ele atrapalha (compra "faca caindo"), mas dentro do score segura a euforia. |
+| **Tendência** | O preço está em alta estrutural? | Três checagens somadas: EMA 9 > EMA 21 (**35 pts**) · MACD > linha de sinal (**35 pts**) · preço > média de 50 dias (**30 pts**). | 100 = as três confirmam. É o componente com maior poder preditivo nos testes. |
+| **Momentum** | Quanto subiu nos últimos 10 dias? | −10% → 0 · 0% → 50 · +10% → 100. **Acima de +15% o valor decai** (a +25% volta a 50, a +35% chega a 0). | Alta forte é boa até certo ponto; alta rápida demais historicamente precede queda. |
+| **Risco** | O ativo está calmo ou nervoso? | 100 − (desvio-padrão dos retornos diários de 20 dias × 10). Vol diária de 3% → 70 pts; 8% → 20 pts. | Prefere entrar em mercados menos voláteis — reduz falsos rompimentos. |
+
+**Score Final** (só no Radar) = 70% Score Técnico + 15% Sentimento das notícias + 15% Fear & Greed *invertido*
+(medo extremo no mercado soma pontos — lógica contrária). O backtesting usa **só o Score Técnico**, porque não há
+histórico confiável de sentimento para simular.
+
+### Escala de decisão
+| Score | Decisão | Score | Decisão |
+|---|---|---|---|
+| ≥ 80 | 🟢 Compra Forte | 41–44 | 🟠 Venda Fraca |
+| 60–79 | 🟢 Compra Média | 21–40 | 🔴 Venda Média |
+| 51–59 | 🟡 Compra Fraca | ≤ 20 | 🔴 Venda Forte |
+| 45–50 | ⚪ Neutro | | |
+
+O **robô do backtest** usa uma regra mais simples e com histerese: **compra quando o score sobe a 65 ou mais e vende
+quando cai a 45 ou menos**; entre 45 e 65 mantém o que estava fazendo. Isso evita entrar e sair a cada oscilação.
+
+**⚠️ Esticado** aparece quando o momentum de 10 dias passa de +15% ou o RSI de 75. É um aviso: nos dados históricos,
+o retorno médio dos 20 dias seguintes a um score acima de 75 foi menor que o da faixa 55–75.
+""")
+
+    with g2:
+        st.markdown("""
+### Radar de Mercado
+
+Duas tabelas com o **mesmo motor** em bases de tempo diferentes:
+
+- **⭐ Watchlist — análise diária.** Usa 1 ano de fechamentos diários (Yahoo Finance). É a leitura oficial: é
+  exatamente o que o backtesting simula. Escolha os ativos na sidebar e clique em *Salvar watchlist*.
+- **🌐 Top 100 — score rápido.** Usa os 168 pontos horários dos últimos 7 dias (CoinGecko). Serve para varrer o mercado
+  e achar candidatos, não para decidir: RSI e EMAs em horas se comportam diferente de dias.
+
+**Cabeçalho:**
+- **Fear & Greed** — índice público (alternative.me) de 0 (medo extremo) a 100 (ganância extrema).
+- **Sentimento geral** — score 0–100 das manchetes do Cointelegraph. Com chave do Gemini na sidebar, a IA lê as
+  manchetes e resume; sem chave, um dicionário de palavras positivas/negativas em português e inglês faz o trabalho.
+- **Regime BTC** — aparece se o filtro estiver ligado: 🟢 BTC acima da sua média de 200 dias, 🔴 abaixo.
+
+**Gráfico** — preços da watchlist; "Normalizar (base 100)" põe todos partindo de 100 para comparar desempenho.
+**Detalhe por ativo** — evolução do score e do RSI, e as notícias que alimentaram o sentimento daquele ativo.
+""")
+        st.markdown(HELP_RADAR)
+
+    with g3:
+        st.markdown("""
+### Backtesting — o que a simulação faz
+
+1. Baixa o histórico diário do ativo (1y, 2y, 5y…).
+2. Calcula o Score Técnico dia a dia, **olhando só para trás** (nenhum indicador usa dados futuros).
+3. Aplica a regra: score ≥ gatilho de compra → fica comprado; score ≤ gatilho de venda → fica em caixa.
+4. O sinal do fechamento de hoje só vale **a partir de amanhã** (não dá para comprar ao preço de fechamento que
+   gerou o sinal).
+5. Cobra a taxa configurada em cada entrada e cada saída.
+6. Compara com **Buy & Hold**: comprar no primeiro dia e não fazer nada.
+
+**Botões:**
+- **▶️ Rodar simulação** — curva de retorno, métricas, lista de trades e CSV auditável (cada dia com todos os
+  indicadores, o score, a posição e o retorno).
+- **🧪 Walk-forward simples** — testa todas as combinações de gatilhos numa parte do histórico (treino) e mostra como
+  cada uma se saiu na parte restante (teste). Se os melhores no treino não repetem no teste, os gatilhos estão
+  ajustados ao passado.
+- **🔁 Walk-forward rolante** — versão em janelas móveis (treina 1 ano, testa 1 trimestre, avança). Mostra também o
+  gatilho fixo no mesmo trecho. Nos testes, o **gatilho fixo venceu a re-otimização** em todos os ativos: use isto
+  para conferir robustez, não para escolher gatilhos.
+- **🩺 Diagnóstico do sinal** — o score de hoje prevê o retorno dos próximos N dias? Correlação por componente e
+  retorno médio por faixa de score.
+- **🎲 Teste de permutação** — embaralha os retornos 200 vezes e roda o robô em cada série. Se o resultado real
+  não é melhor que 95% dos embaralhados, foi sorte.
+- **🏁 Veredito por ativo** — roda tudo isso para vários ativos de uma vez e classifica cada um.
+""")
+        st.markdown(HELP_BACKTEST)
+
+    with g4:
+        st.markdown("""
+### Por que os testes de confiança existem
+
+Um backtest com retorno de +300% não prova nada: com poucos trades, basta um acerto grande. Três perguntas
+separam um resultado real de uma coincidência, e cada uma tem um botão:
+
+**1. "Isso pode ter sido sorte?" → Teste de permutação.**
+Embaralhamos a ordem dos retornos diários (a distribuição fica igual, mas a sequência — a tendência — some) e
+rodamos o robô 200 vezes. Se o Sharpe real for maior que 95% dos Sharpes embaralhados, o **p-valor** é < 0,05 e há
+evidência de que o robô captura algo real na *ordem* dos preços. Em SOL 5 anos: p = 0,007 ✅. Em BTC e ETH: p ≈ 0,17 ❌.
+
+**2. "Funciona em dados que não foram usados para ajustar nada?" → Fora da amostra (OOS).**
+Qualquer número calculado no mesmo período em que os parâmetros foram escolhidos é otimista. O trecho OOS
+(a partir do dia 252, ou as janelas do rolante) é a única estimativa honesta do que esperar. Regra: **se o Sharpe
+OOS não supera o do hold, o robô não compensa** naquele ativo.
+
+**3. "O score antecipa o retorno ou só o descreve?" → Diagnóstico.**
+Correlação entre o score de hoje e o retorno de 5/10/20 dias à frente. Em finanças, 0,05 já é sinal e 0,10 é forte.
+O motor mostra sinal apenas em horizontes de 3–4 semanas; em 5 dias é ruído — por isso trades curtos tendem a perder.
+
+**Como ler o veredito:**
+- ✅ **Sinal real** — p < 0,05 **e** bate o hold fora da amostra. Usar o robô.
+- 🛡️ **Só reduz drawdown** — sem evidência estatística, mas o drawdown OOS é menor e o Sharpe não é pior que o hold.
+  O robô funciona como freio, não como acelerador.
+- ❌ **Sem vantagem** — hold.
+
+**Aviso sobre n pequeno:** menos de ~8 trades ou menos de 2 anos de dados não permitem concluir nada; o app avisa.
+""")
+
+    with g5:
+        st.markdown("""
+### Sidebar — filtros e parâmetros
+
+**🔧 Parâmetros do motor** — períodos dos indicadores e pesos do score. Os padrões são os validados; mexer neles
+exige rodar de novo permutação e OOS. Os pesos são normalizados automaticamente (só a proporção importa).
+
+**🛡️ Filtros de risco**
+- **Filtro de regime BTC** — só permite posição comprada quando o BTC está acima da sua média de 200 dias. Lógica:
+  altcoins raramente sobem com BTC em baixa. Resultado nos testes: **reduz drawdown** (SOL 5y: −54% → −38%) mas
+  **custa retorno fora da amostra** (+226% → +104%), porque SOL sai do fundo antes do BTC. Médias mais curtas
+  (100/150) pioram. Desligado por padrão; ligue se prioriza risco menor.
+- **Não comprar esticado** — bloqueia novas compras com o aviso ⚠️ ativo. **Piorou tudo** nos testes: bloqueia
+  exatamente os rompimentos que pagam a estratégia. Desligado por padrão; existe para você comprovar.
+
+**💾 Salvar parâmetros** — grava tudo em `parametros.json`; sem isso, recarregar o app volta aos padrões.
+**↩️ Restaurar padrões validados** — apaga o arquivo.
+
+**Gatilhos (aba Backtesting)** — 65/45 é um platô, não um pico: qualquer valor entre 65–75 / 45–55 dá resultado
+parecido, e re-otimizar a cada trimestre piora. Trate como constante.
+
+**Taxa por operação** — 0,10% cobre corretagem típica de exchange + um pouco de slippage. Cobrada na entrada e na saída.
+""")
+
+    with g6:
+        st.markdown("""
+### O que já foi validado (e o que foi derrubado)
+
+Resultados com a configuração padrão, 5 anos (out/2021 – set/2026), taxa 0,1%, gatilhos 65/45, sem filtros:
+
+| Ativo | Vol. anual | Robô / Hold | Drawdown robô / hold | p-valor | OOS robô / hold (Sharpe) | Veredito |
+|---|---|---|---|---|---|---|
+| **SOL** | 93% | +778% / −35% | −54% / −96% | **0,007** | 1,05 / 0,72 | ✅ Sinal real |
+| **ETH** | 69% | +67% / −23% | −50% / −79% | 0,18 | 0,59 / 0,61 | 🛡️ Só reduz drawdown |
+| **BTC** | 51% | +147% / +69% | −65% / −77% | 0,17 | 0,84 / 0,91 | ❌ Sem vantagem |
+
+**Padrão observado:** o motor funciona em ativos de **beta alto** (tendências longas e violentas, onde tendência +
+momentum pagam). Em BTC e ETH ele só reduz drawdown, trocando retorno por tranquilidade. Hipótese ainda com n = 1;
+o painel Veredito com outras altcoins (AVAX, LINK, DOGE…) é o teste que falta.
+
+**Perfil dos trades (SOL):** win rate ~37%, ganho médio +41%, perda média −10%, payoff 4:1. Três ou quatro
+tendências por ciclo pagam dezenas de perdas pequenas. **Isso exige aceitar sequências de 4–5 perdas seguidas** — quem
+não aceita, não deve usar seguidor de tendência.
+
+**Ideias testadas e derrubadas pelos dados** (todas pareciam boas):
+- Zerar o peso do RSI (sugerido pela correlação) → p-valor foi de 0,007 para 0,42. O RSI segura a euforia dentro do score.
+- Bloquear compras esticadas → piorou in-sample e OOS.
+- Regime BTC com média mais curta → piorou OOS.
+- Re-otimizar gatilhos a cada trimestre → perdeu para o fixo nos três ativos.
+
+### Limitações honestas
+- Cinco anos = um ciclo e meio de cripto. O futuro pode ter outro regime.
+- Só posição comprada ou caixa; sem short, sem alavancagem, sem stop-loss intradiário.
+- Preços de fechamento diário; a execução real terá slippage maior em altcoins pequenas.
+- Sentimento e Fear & Greed não entram no backtest — o Score Final do Radar não está validado, só o Score Técnico.
+- Nada aqui é recomendação de investimento.
+""")
