@@ -41,6 +41,9 @@ v3.7 — resultado do sentimento em SOL (tom diário GDELT, build_sentiment_time
   * Como FILTRO DE ENTRADA (sentimento ≥ 50) melhora: Sharpe OOS 1,05 → 1,18, metade das entradas.
     Opção na sidebar ("Confirmar entradas com sentimento"), desligada por padrão até validar em mais ativos.
   * Volume de cobertura como filtro contrarian: descartado (bloqueia os rompimentos que pagam).
+v3.8 — aba 🃏 Decisão (cartão de decisão): gatilhos traduzidos em níveis de preço para o próximo fechamento,
+  estatísticas condicionais do histórico de trades (acerto, ganho/perda típicos, sequência de perdas, queda
+  intra-trade), contexto da entrada atual (após alta forte ou não) e cartão em texto para copiar.
 """
 
 import streamlit as st
@@ -685,6 +688,86 @@ def basket_backtest(hist_map: dict, p: dict, buy_thr=65, sell_thr=45, fee_pct=0.
     return out
 
 
+def price_levels(close: pd.Series, p: dict, buy_thr: float, sell_thr: float, sent=None, span=0.45, n=181,
+                 lookback=420):
+    """
+    Traduz os gatilhos de score em NÍVEIS DE PREÇO para o PRÓXIMO fechamento: varre fechamentos candidatos
+    (−span..+span do preço atual), recalcula o score com cada um e acha onde ele cruza os gatilhos.
+    Retorna dict com 'sell' (maior preço abaixo do atual com score ≤ venda), 'buy' (menor preço acima com
+    score ≥ compra), a curva (preço, score) e o score atual.
+    """
+    hist = close.dropna().iloc[-lookback:]
+    last = float(hist.iloc[-1])
+    cands = last * np.linspace(1 - span, 1 + span, n)
+    s_val = None
+    if sent is not None:
+        s_ff = pd.Series(sent).reindex(hist.index).ffill(limit=21)
+        s_val = float(s_ff.iloc[-1]) if s_ff.notna().any() and not np.isnan(s_ff.iloc[-1]) else None
+    scores = []
+    nxt = hist.index[-1] + pd.Timedelta(days=1)
+    for c in cands:
+        ext = pd.concat([hist, pd.Series([c], index=[nxt])])
+        sent_ext = pd.Series([s_val], index=[nxt]) if s_val is not None else None
+        if sent is not None and s_val is not None:
+            sent_ext = pd.concat([pd.Series(sent).reindex(hist.index), sent_ext])
+        scores.append(float(compute_indicators(ext, None, p, sent_ext)["Score"].iloc[-1]))
+    scores = np.array(scores)
+    curva = pd.DataFrame({"Preço": cands, "Score": scores})
+    score_now = float(compute_indicators(hist, None, p, pd.Series(sent).reindex(hist.index) if sent is not None else None)["Score"].iloc[-1])
+    below = curva[curva["Preço"] <= last]
+    above = curva[curva["Preço"] >= last]
+    sell = below[below["Score"] <= sell_thr]["Preço"].max() if (below["Score"] <= sell_thr).any() else np.nan
+    buy = above[above["Score"] >= buy_thr]["Preço"].min() if (above["Score"] >= buy_thr).any() else np.nan
+    return {"last": last, "sell": float(sell), "buy": float(buy), "curva": curva, "score_now": score_now,
+            "score_min": float(scores.min()), "score_max": float(scores.max())}
+
+
+def trade_stats(trades: pd.DataFrame, close: pd.Series):
+    """Estatísticas condicionais do histórico de trades do robô (o que esperar de uma entrada/saída)."""
+    if trades is None or trades.empty:
+        return None
+    t = trades.copy()
+    t["Entrada"] = pd.to_datetime(t["Entrada"]); t["Saída"] = pd.to_datetime(t["Saída"])
+    t["Dias"] = (t["Saída"] - t["Entrada"]).dt.days
+    # variação dos 30 dias ANTES de cada entrada (contexto da entrada)
+    prev30 = []
+    for d in t["Entrada"]:
+        i = close.index.get_indexer([d])[0]
+        prev30.append((close.iloc[i] / close.iloc[i - 30] - 1) * 100 if i >= 30 else np.nan)
+    t["Alta 30d antes (%)"] = prev30
+    closed = t[~t["Aberta"]]
+    win = closed[closed["Retorno (%)"] > 0]; loss = closed[closed["Retorno (%)"] <= 0]
+    # maior sequência de perdas
+    seq = best = 0
+    for r in closed["Retorno (%)"]:
+        seq = seq + 1 if r <= 0 else 0; best = max(best, seq)
+    # entradas após alta forte vs demais
+    hot = closed[closed["Alta 30d antes (%)"] > 30]; cold = closed[closed["Alta 30d antes (%)"] <= 30]
+    # MAE aproximado: pior fechamento dentro do trade vs preço de entrada
+    mae = []
+    for _, r in closed.iterrows():
+        seg = close.loc[r["Entrada"]:r["Saída"]]
+        mae.append((seg.min() / r["Preço Entrada"] - 1) * 100 if len(seg) else np.nan)
+    closed = closed.assign(MAE=mae)
+    return {
+        "n": int(len(closed)), "win_rate": float((closed["Retorno (%)"] > 0).mean() * 100) if len(closed) else np.nan,
+        "ganho_med": float(win["Retorno (%)"].median()) if len(win) else np.nan,
+        "ganho_dias": float(win["Dias"].median()) if len(win) else np.nan,
+        "perda_med": float(loss["Retorno (%)"].median()) if len(loss) else np.nan,
+        "perda_dias": float(loss["Dias"].median()) if len(loss) else np.nan,
+        "pior": float(closed["Retorno (%)"].min()) if len(closed) else np.nan,
+        "melhor": float(closed["Retorno (%)"].max()) if len(closed) else np.nan,
+        "expectancia": float(closed["Retorno (%)"].mean()) if len(closed) else np.nan,
+        "max_seq_perdas": int(best),
+        "mae_med": float(np.nanmedian(closed["MAE"])) if len(closed) else np.nan,
+        "hot_n": int(len(hot)), "hot_ret": float(hot["Retorno (%)"].mean()) if len(hot) else np.nan,
+        "hot_win": float((hot["Retorno (%)"] > 0).mean() * 100) if len(hot) else np.nan,
+        "cold_n": int(len(cold)), "cold_ret": float(cold["Retorno (%)"].mean()) if len(cold) else np.nan,
+        "cold_win": float((cold["Retorno (%)"] > 0).mean() * 100) if len(cold) else np.nan,
+        "trades": t,
+    }
+
+
 def permutation_test(close: pd.Series, p: dict, buy_thr, sell_thr, fee_pct, n_iter=200, seed=0, sent=None, **bt_kw):
     """
     Embaralha os retornos diários (destrói a estrutura temporal, preserva a distribuição), recalcula
@@ -873,8 +956,8 @@ def sent_gate_for(ativo):
 # =====================================================================
 # 7. ABAS
 # =====================================================================
-tab1, tab2, tab3, tab5, tab4 = st.tabs(["📊 Radar de Mercado", "💼 Simulador de Carteira", "⏪ Backtesting",
-                                        "🧺 Cesta", "📖 Guia"])
+tab1, tab6, tab2, tab3, tab5, tab4 = st.tabs(["📊 Radar de Mercado", "🃏 Decisão", "💼 Simulador de Carteira",
+                                              "⏪ Backtesting", "🧺 Cesta", "📖 Guia"])
 
 # Textos de ajuda reutilizados nas tabelas (versão curta; a aba Guia tem a completa)
 HELP_RADAR = """
@@ -1472,6 +1555,138 @@ with tab3:
         st.download_button("📥 Baixar veredito (CSV)", dv.to_csv(index=False).encode("utf-8"), "veredito_ativos.csv", "text/csv")
 
 # ---------------------------------------------------------------------
+# ABA 6 — CARTÃO DE DECISÃO
+# ---------------------------------------------------------------------
+with tab6:
+    st.subheader("🃏 Cartão de Decisão")
+    st.caption("A regra do robô traduzida em preço, e o que o próprio histórico diz sobre o que esperar. "
+               "Não prevê o mercado — calibra a sua expectativa e tira a decisão do calor do momento.")
+    d1, d2 = st.columns([2, 1])
+    opcoes_dec = sorted(set(watchlist) | {"SOL", "BTC", "ETH"} | set(lista_ativos))
+    ativo_dec = d1.selectbox("Ativo:", opcoes_dec, index=opcoes_dec.index("SOL") if "SOL" in opcoes_dec else 0, key="dec_ativo")
+    periodo_dec = d2.selectbox("Histórico para as estatísticas:", ["5y", "2y", "max"], key="dec_periodo")
+    if st.button("🃏 Gerar cartão"):
+        tk = f"{ativo_dec}-USD"
+        with st.spinner(f"Baixando {tk}..."):
+            hist_d, miss_d, err_d = get_daily_history((tk,), periodo_dec)
+        if tk not in hist_d:
+            st.error(f"Sem dados para {tk}" + (f": {err_d}" if err_d else ""))
+        else:
+            h = hist_d[tk]; close = h["Close"]
+            sent_d = SENT_MAP.get(ativo_dec)
+            gate_d = sent_gate_for(ativo_dec)
+            kw = {**BT_KW, "entry_gate": gate_d}
+            ind = compute_indicators(close, h.get("Volume"), P, sent_d).dropna(subset=["Score"])
+            res, m, trades = run_backtest(ind, int(S0["buy_thr"]), int(S0["sell_thr"]), float(S0["fee"]), **kw)
+            with st.spinner("Calculando níveis de preço..."):
+                lv = price_levels(close, P, int(S0["buy_thr"]), int(S0["sell_thr"]), sent_d)
+            st.session_state["cartao"] = {"ativo": ativo_dec, "res": res, "m": m, "trades": trades, "lv": lv,
+                                          "stats": trade_stats(trades, close), "close": close, "gate": gate_d,
+                                          "sent": sent_d}
+    C = st.session_state.get("cartao")
+    if C and C["ativo"] == ativo_dec:
+        res, m, lv, S_, close = C["res"], C["m"], C["lv"], C["stats"], C["close"]
+        last = res.iloc[-1]; comprado = last["Pos"] == 1
+        dias_estado = int((res["Pos"].iloc[::-1] != last["Pos"]).values.argmax()) if (res["Pos"] != last["Pos"]).any() else len(res)
+        buy_thr, sell_thr = int(S0["buy_thr"]), int(S0["sell_thr"])
+        regime_txt = ""
+        if use_regime and REGIME is not None and not regime_now:
+            regime_txt = " · ⏸️ BTC abaixo da MA200: compras bloqueadas pelo filtro de regime"
+        gate_txt = ""
+        if C["gate"] is not None:
+            g_now = C["gate"].reindex([res.index[-1]]).ffill().iloc[-1]
+            gate_txt = f" · 🗞️ sentimento {'libera' if g_now else 'BLOQUEIA'} novas entradas hoje"
+
+        # ---------- 1. Estado e níveis ----------
+        st.markdown(f"## {C['ativo']} — {'🟢 COMPRADO' if comprado else '⚪ EM CAIXA'} há {dias_estado} dias")
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Último fechamento", fmt_price(lv["last"]))
+        c2.metric("Score hoje", f"{lv['score_now']:.0f}", f"compra ≥ {buy_thr} · venda ≤ {sell_thr}", delta_color="off")
+        if comprado:
+            if np.isnan(lv["sell"]):
+                c3.metric("Vende se fechar abaixo de", "—", f"não alcançável com queda de até 45% em 1 dia", delta_color="off")
+            else:
+                c3.metric("Vende se fechar abaixo de", fmt_price(lv["sell"]), f"{(lv['sell'] / lv['last'] - 1) * 100:+.1f}% do preço atual",
+                          delta_color="off")
+            aberto = C["trades"].iloc[-1] if len(C["trades"]) and C["trades"].iloc[-1]["Aberta"] else None
+            c4.metric("Trade aberto", f"{aberto['Retorno (%)']:+.1f}%" if aberto is not None else "—",
+                      f"entrou a {fmt_price(aberto['Preço Entrada'])} em {pd.to_datetime(aberto['Entrada']).strftime('%d/%m/%Y')}"
+                      if aberto is not None else "", delta_color="off")
+        else:
+            if np.isnan(lv["buy"]):
+                c3.metric("Compra se fechar acima de", "—", "não alcançável com alta de até 45% em 1 dia", delta_color="off")
+            else:
+                c3.metric("Compra se fechar acima de", fmt_price(lv["buy"]), f"{(lv['buy'] / lv['last'] - 1) * 100:+.1f}% do preço atual",
+                          delta_color="off")
+            c4.metric("Distância ao gatilho", f"{buy_thr - lv['score_now']:.0f} pts de score")
+        st.caption(f"Níveis valem para o **próximo fechamento diário** e mudam a cada dia (recalcule). "
+                   f"Filtros ativos: {filtros_txt}{regime_txt}{gate_txt}.")
+
+        fig_lv = go.Figure()
+        fig_lv.add_trace(go.Scatter(x=lv["curva"]["Preço"], y=lv["curva"]["Score"], mode="lines", name="Score se fechar em…",
+                                    line=dict(color="green", width=2)))
+        fig_lv.add_hline(y=buy_thr, line_dash="dash", line_color="green", annotation_text=f"compra {buy_thr}")
+        fig_lv.add_hline(y=sell_thr, line_dash="dash", line_color="red", annotation_text=f"venda {sell_thr}")
+        fig_lv.add_vline(x=lv["last"], line_color="gray", annotation_text="preço atual")
+        if comprado and not np.isnan(lv["sell"]):
+            fig_lv.add_vline(x=lv["sell"], line_color="red", line_dash="dot")
+        if not comprado and not np.isnan(lv["buy"]):
+            fig_lv.add_vline(x=lv["buy"], line_color="green", line_dash="dot")
+        fig_lv.update_layout(template="plotly_white", height=300, margin=dict(t=30, b=10),
+                             xaxis_title="Fechamento de amanhã (USD)", yaxis_title="Score resultante",
+                             title="Como o score reage ao próximo fechamento")
+        st.plotly_chart(fig_lv, **_W)
+
+        # ---------- 2. O que esperar ----------
+        if S_ and S_["n"] >= 5:
+            st.markdown("### O que esperar — histórico do robô neste ativo")
+            e1, e2, e3, e4 = st.columns(4)
+            e1.metric("Trades fechados", f"{S_['n']}", f"acerto {S_['win_rate']:.0f}%", delta_color="off")
+            e2.metric("Quando dá certo", f"{S_['ganho_med']:+.0f}%", f"mediana · ~{S_['ganho_dias']:.0f} dias", delta_color="off")
+            e3.metric("Quando dá errado", f"{S_['perda_med']:+.0f}%", f"mediana · ~{S_['perda_dias']:.0f} dias", delta_color="off")
+            e4.metric("Expectativa por trade", f"{S_['expectancia']:+.1f}%", f"pior {S_['pior']:.0f}% · melhor {S_['melhor']:+.0f}%",
+                      delta_color="off")
+            st.info(f"**Sequência de perdas mais longa: {S_['max_seq_perdas']} seguidas.** Dentro de um trade, o preço caiu em "
+                    f"mediana **{S_['mae_med']:.0f}%** abaixo da entrada antes de o trade terminar (mesmo nos que deram certo). "
+                    "Se isso não é aceitável, o problema não é o sinal — é o tamanho da posição.")
+            # contexto da entrada atual
+            var30 = (close.iloc[-1] / close.iloc[-31] - 1) * 100 if len(close) > 31 else np.nan
+            st.markdown("### Onde você está agora")
+            o1, o2 = st.columns([1, 2])
+            o1.metric("Variação dos últimos 30 dias", f"{var30:+.1f}%")
+            if S_["hot_n"] >= 3 and S_["cold_n"] >= 3:
+                o2.markdown(f"Entradas do robô **após alta de mais de 30% em 30 dias** ({S_['hot_n']} casos): "
+                            f"retorno médio **{S_['hot_ret']:+.1f}%**, acerto {S_['hot_win']:.0f}%.  \n"
+                            f"Entradas **sem alta forte antes** ({S_['cold_n']} casos): retorno médio **{S_['cold_ret']:+.1f}%**, "
+                            f"acerto {S_['cold_win']:.0f}%.")
+                if var30 > 30:
+                    st.warning("Você está olhando este ativo depois de uma alta forte. Compare as duas linhas acima antes de "
+                               "decidir — e lembre que o robô não bloqueia essas entradas porque bloquear custou retorno; "
+                               "ele só pede que você entre sabendo.")
+            else:
+                o2.caption("Poucos casos para separar entradas após alta forte das demais.")
+            with st.expander("📋 Todos os trades do robô neste ativo"):
+                t = S_["trades"].copy()
+                t["Entrada"] = t["Entrada"].dt.strftime("%d/%m/%Y"); t["Saída"] = t["Saída"].dt.strftime("%d/%m/%Y")
+                st.dataframe(t[["Entrada", "Saída", "Dias", "Preço Entrada", "Preço Saída", "Retorno (%)", "Alta 30d antes (%)", "Aberta"]]
+                             .style.format({"Preço Entrada": fmt_price, "Preço Saída": fmt_price, "Retorno (%)": "{:+.1f}%",
+                                            "Alta 30d antes (%)": "{:+.0f}%"})
+                             .background_gradient(subset=["Retorno (%)"], cmap="RdYlGn", vmin=-20, vmax=20), hide_index=True, **_W)
+        else:
+            st.caption("Poucos trades no histórico para estatísticas confiáveis (use 5y ou max).")
+
+        # ---------- cartão para copiar ----------
+        nivel = (f"VENDE se fechar abaixo de {fmt_price(lv['sell'])}" if comprado and not np.isnan(lv["sell"]) else
+                 f"COMPRA se fechar acima de {fmt_price(lv['buy'])}" if not comprado and not np.isnan(lv["buy"]) else "sem nível alcançável em 1 dia")
+        txt = (f"{C['ativo']} · {res.index[-1].strftime('%d/%m/%Y')} · {'COMPRADO' if comprado else 'EM CAIXA'} há {dias_estado} d\n"
+               f"Preço {fmt_price(lv['last'])} · Score {lv['score_now']:.0f} (compra ≥ {buy_thr}, venda ≤ {sell_thr})\n"
+               f"Regra para amanhã: {nivel}\n")
+        if S_ and S_["n"] >= 5:
+            txt += (f"Histórico: {S_['n']} trades, acerto {S_['win_rate']:.0f}%, ganho típico {S_['ganho_med']:+.0f}% em ~{S_['ganho_dias']:.0f} d, "
+                    f"perda típica {S_['perda_med']:+.0f}% em ~{S_['perda_dias']:.0f} d, até {S_['max_seq_perdas']} perdas seguidas.\n")
+        st.text_area("Cartão (copiar):", txt, height=120)
+
+# ---------------------------------------------------------------------
 # ABA 5 — CESTA
 # ---------------------------------------------------------------------
 with tab5:
@@ -1572,8 +1787,41 @@ teria acontecido se você seguisse esse score no passado, e **testa** se esse re
 Nada aqui é recomendação de investimento — é um instrumento de medição, com as limitações descritas no final.
 """)
 
-    g1, g2, g3, g4, g5, g6, g7 = st.tabs(["1. O score", "2. Radar", "3. Backtesting", "4. Os testes de confiança",
-                                          "5. Filtros e parâmetros", "6. O que já foi validado", "7. Cesta"])
+    g1, g2, g3, g4, g5, g6, g7, g8 = st.tabs(["1. O score", "2. Radar", "3. Backtesting", "4. Os testes de confiança",
+                                              "5. Filtros e parâmetros", "6. O que já foi validado", "7. Cesta",
+                                              "8. Cartão de Decisão"])
+
+    with g8:
+        st.markdown("""
+### Cartão de Decisão — para a hora de entrar ou sair
+
+O que mais atrapalha na hora de decidir não é falta de sinal: é entrar no hype, sair no pânico e não saber que
+tamanho de queda vem "no pacote" de uma estratégia. O cartão traduz o robô em três coisas que uma pessoa consegue
+usar sob pressão:
+
+**1. A regra em preço, não em score.** "Vende se fechar abaixo de $91,41" / "Compra se fechar acima de $X".
+O app varre fechamentos possíveis para amanhã (−45% a +45%), recalcula o score com cada um e acha onde ele cruza os
+gatilhos. Vale para o **próximo fechamento diário** e muda todo dia. O gráfico mostra a curva inteira: os degraus
+são os componentes binários da tendência (um cruzamento de médias vale 35 pontos de uma vez).
+Uso prático: coloque um alerta de preço na corretora nesse nível e pare de olhar o gráfico.
+
+**2. O que esperar, com base no próprio histórico do robô neste ativo.** Trades fechados, taxa de acerto, ganho e
+perda típicos (medianas) com a duração de cada um, expectativa por trade, pior e melhor caso, **maior sequência de
+perdas** e a queda mediana abaixo do preço de entrada dentro de um trade (mesmo nos que deram certo). Esses dois
+últimos números são os que fazem as pessoas abandonarem estratégias boas na hora errada. Se a sequência de perdas ou
+a queda intra-trade não são aceitáveis, o ajuste é no **tamanho da posição**, não no sinal.
+
+**3. Onde você está agora.** A variação dos últimos 30 dias e, ao lado, como se saíram as entradas do robô feitas
+após alta forte (> 30% em 30 dias) contra as demais. O robô não bloqueia entradas após alta (bloquear custou retorno
+nos testes) — ele só pede que você entre sabendo o número.
+
+**Cartão para copiar** — resumo em texto para guardar ou mandar a alguém: estado, preço, score, regra para amanhã
+e o que esperar. Uma decisão registrada antes do calor do momento vale mais que qualquer previsão.
+
+Limites: as estatísticas são do robô, não de qualquer entrada arbitrária; com menos de ~20 trades fechados a
+dispersão é grande; e os níveis de preço pressupõem que os filtros ligados (regime, sentimento) estejam no mesmo
+estado amanhã.
+""")
 
     with g7:
         st.markdown("""
