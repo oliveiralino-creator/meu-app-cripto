@@ -36,6 +36,11 @@ v3.6 — sentimento histórico como 5º componente (experimental, peso 0):
   * build_sentiment_history.py coleta manchetes datadas (GDELT) por ativo/semana e pontua (léxico e/ou Gemini).
   * O backtest lê sentimento_historico.csv sem look-ahead (semana vale a partir da segunda seguinte) e o botão
     "🗞️ Testar sentimento" compara com/sem, in-sample, OOS e permutação.
+v3.7 — resultado do sentimento em SOL (tom diário GDELT, build_sentiment_timeline.py):
+  * Como componente do score PIORA (atrasa saídas): peso fica 0.
+  * Como FILTRO DE ENTRADA (sentimento ≥ 50) melhora: Sharpe OOS 1,05 → 1,18, metade das entradas.
+    Opção na sidebar ("Confirmar entradas com sentimento"), desligada por padrão até validar em mais ativos.
+  * Volume de cobertura como filtro contrarian: descartado (bloqueia os rompimentos que pagam).
 """
 
 import streamlit as st
@@ -312,7 +317,8 @@ def load_sentiment_history(path: str = SENT_FILE, prefer_ai: bool = True):
         out[a] = {"serie": daily, "fonte": col, "semanas": int(g["n_manchetes"].ge(3).sum()),
                   "de": g["data"].min().date(), "ate": g["data"].max().date()}
     return out, None
-DEFAULT_SETTINGS = dict(use_regime=False, regime_ma=200, skip_stretched=False, buy_thr=65, sell_thr=45, fee=0.10)
+DEFAULT_SETTINGS = dict(use_regime=False, regime_ma=200, skip_stretched=False, buy_thr=65, sell_thr=45, fee=0.10,
+                        sent_gate=False, sent_gate_thr=50)
 PARAMS_FILE = "parametros.json"
 
 
@@ -406,10 +412,13 @@ def compute_indicators(close: pd.Series, volume: pd.Series | None = None, p: dic
     if sent is not None and p.get("w_sent", 0) > 0:
         s = pd.Series(sent).reindex(df.index).ffill(limit=21) if isinstance(df.index, pd.DatetimeIndex) else None
         if s is not None and s.notna().any():
-            df["S_SENT"] = s.fillna(50.0).clip(0, 100)   # sem informação → neutro (50)
-            score = score + p["w_sent"] * df["S_SENT"]
-            wtot += p["w_sent"]
-    df["Score"] = score / (wtot or 1.0)
+            df["S_SENT"] = s.clip(0, 100)
+            # dia sem sentimento: o componente sai do cálculo e os demais pesos são renormalizados
+            # (preencher com 50 diluía o score com uma constante e bloqueava os gatilhos)
+            has = df["S_SENT"].notna()
+            score = np.where(has, score + p["w_sent"] * df["S_SENT"].fillna(0), score)
+            wtot = np.where(has, wtot + p["w_sent"], wtot)
+    df["Score"] = score / np.where(wtot == 0, 1.0, wtot)
     return df
 
 
@@ -444,17 +453,21 @@ def classify_action(score, esticado=False, regime_ok=True):
 # 4. BACKTEST E OTIMIZAÇÃO WALK-FORWARD
 # =====================================================================
 def run_backtest(ind: pd.DataFrame, buy_thr: float, sell_thr: float, fee_pct: float = 0.1,
-                 periods_per_year: int = 365, regime: pd.Series | None = None, skip_stretched: bool = False):
+                 periods_per_year: int = 365, regime: pd.Series | None = None, skip_stretched: bool = False,
+                 entry_gate: pd.Series | None = None):
     """
     Sinal gerado no fechamento de t, exposição vale a partir de t+1 (shift). Taxa cobrada a cada troca de posição.
     regime: série booleana (True = pode estar comprado); fora do regime a posição é zerada.
     skip_stretched: não abre compra quando o ativo está esticado (mas mantém posição já aberta).
+    entry_gate: série booleana — False bloqueia NOVAS compras naquele dia (a saída não muda). Dias ausentes = True.
     Retorna (DataFrame com equity, dict de métricas, DataFrame de trades).
     """
     df = ind.copy()
     buy = df["Score"] >= buy_thr
     if skip_stretched and "Esticado" in df:
         buy = buy & ~df["Esticado"].fillna(False).astype(bool)
+    if entry_gate is not None:
+        buy = buy & entry_gate.reindex(df.index).fillna(True).astype(bool)
     sig = pd.Series(np.nan, index=df.index, dtype="float64")
     sig[buy] = 1.0
     sig[df["Score"] <= sell_thr] = 0.0
@@ -585,7 +598,8 @@ def signal_diagnostics(ind: pd.DataFrame, horizon: int = 10):
     return corr, by, len(d)
 
 
-def asset_verdict(close: pd.Series, p: dict, buy_thr=65, sell_thr=45, fee_pct=0.1, oos_start=252, n_perm=100, sent=None):
+def asset_verdict(close: pd.Series, p: dict, buy_thr=65, sell_thr=45, fee_pct=0.1, oos_start=252, n_perm=100, sent=None,
+                  entry_gate=None):
     """
     Bateria de validação de um ativo com gatilhos FIXOS:
       in-sample completo, permutação (p-valor), trecho OOS (a partir de oos_start, sem nenhuma otimização)
@@ -594,10 +608,10 @@ def asset_verdict(close: pd.Series, p: dict, buy_thr=65, sell_thr=45, fee_pct=0.
     ind = compute_indicators(close, None, p, sent).dropna(subset=["Score"])
     if len(ind) < oos_start + 120:
         return {"erro": f"histórico curto ({len(ind)} dias)"}
-    _, m_is, _ = run_backtest(ind, buy_thr, sell_thr, fee_pct)
-    _, m_oos, _ = run_backtest(ind.iloc[oos_start:], buy_thr, sell_thr, fee_pct)
+    _, m_is, _ = run_backtest(ind, buy_thr, sell_thr, fee_pct, entry_gate=entry_gate)
+    _, m_oos, _ = run_backtest(ind.iloc[oos_start:], buy_thr, sell_thr, fee_pct, entry_gate=entry_gate)
     corr, _, _ = signal_diagnostics(ind, 20)
-    sh_real, perm, pval = permutation_test(close, p, buy_thr, sell_thr, fee_pct, n_iter=n_perm, sent=sent)
+    sh_real, perm, pval = permutation_test(close, p, buy_thr, sell_thr, fee_pct, n_iter=n_perm, sent=sent, entry_gate=entry_gate)
     vol = float(close.pct_change().std() * np.sqrt(365) * 100)
     sinal = pval < 0.05
     bate_hold = m_oos["sharpe_robo"] > m_oos["sharpe_hold"] and m_oos["ret_robo"] > m_oos["ret_hold"]
@@ -616,7 +630,8 @@ def asset_verdict(close: pd.Series, p: dict, buy_thr=65, sell_thr=45, fee_pct=0.
             "Veredito": veredito, "_dias": len(ind)}
 
 
-def basket_backtest(hist_map: dict, p: dict, buy_thr=65, sell_thr=45, fee_pct=0.1, oos_start=252, sent_map=None, **bt_kw):
+def basket_backtest(hist_map: dict, p: dict, buy_thr=65, sell_thr=45, fee_pct=0.1, oos_start=252, sent_map=None,
+                    gate_fn=None, **bt_kw):
     """
     Roda o robô em cada ativo e monta uma cesta de peso igual, rebalanceada diariamente.
     Retorna dict com séries de retorno (robô/hold), tabela por ativo, por ano e estado atual de cada ativo.
@@ -627,7 +642,7 @@ def basket_backtest(hist_map: dict, p: dict, buy_thr=65, sell_thr=45, fee_pct=0.
         ind = compute_indicators(h["Close"], h.get("Volume"), p, (sent_map or {}).get(a)).dropna(subset=["Score"])
         if len(ind) < 60:
             continue
-        res, m, _ = run_backtest(ind, buy_thr, sell_thr, fee_pct, **bt_kw)
+        res, m, _ = run_backtest(ind, buy_thr, sell_thr, fee_pct, entry_gate=(gate_fn(a) if gate_fn else None), **bt_kw)
         R[a], H[a] = res["Ret_Robo"], res["Ret"]
         last = res.iloc[-1]
         dias_pos = int((res["Pos"].iloc[::-1] != last["Pos"]).values.argmax()) if (res["Pos"] != last["Pos"]).any() else len(res)
@@ -795,12 +810,22 @@ with st.sidebar.expander("🛡️ Filtros de risco", expanded=True):
                                     "piorou o resultado in-sample e fora da amostra (bloqueia exatamente os rompimentos). "
                                     "O score já penaliza momentum extremo de forma suave.")
 
+with st.sidebar.expander("🗞️ Sentimento de notícias (histórico)", expanded=False):
+    sent_gate_on = st.toggle("Confirmar entradas com sentimento", value=bool(S0.get("sent_gate", False)),
+                             help="Só abre compra quando o sentimento histórico do ativo está acima do limiar; a saída "
+                                  "não muda. Em SOL (2021–26) subiu o Sharpe fora da amostra de 1,12 para 1,34 e cortou "
+                                  "as entradas quase pela metade. Validado em UM ativo — desligado por padrão. "
+                                  "Requer sentimento_historico.csv.")
+    sent_gate_thr = st.slider("Limiar do sentimento", 30, 70, int(S0.get("sent_gate_thr", 50)), 5)
+    st.caption("Como componente do score (peso na seção acima) o sentimento PIOROU o resultado — ele atrasa saídas.")
+
 st.sidebar.divider()
 st.sidebar.caption(("📂 Parâmetros carregados de `parametros.json`." if params_from_file
                     else "Usando padrões validados (SOL 5y).") +
                    " Salve para que sobrevivam ao recarregar o app.")
 if st.sidebar.button("💾 Salvar parâmetros e filtros"):
     S_now = {"use_regime": use_regime, "regime_ma": regime_ma, "skip_stretched": skip_stretched,
+             "sent_gate": sent_gate_on, "sent_gate_thr": sent_gate_thr,
              "buy_thr": st.session_state.get("bt_buy", S0["buy_thr"]),
              "sell_thr": st.session_state.get("bt_sell", S0["sell_thr"]),
              "fee": st.session_state.get("bt_fee", S0["fee"])}
@@ -829,6 +854,13 @@ if use_regime:
 BT_KW = {"regime": REGIME, "skip_stretched": skip_stretched}
 SENT_HIST, sent_err = load_sentiment_history()
 SENT_MAP = {a: v["serie"] for a, v in SENT_HIST.items()}
+
+
+def sent_gate_for(ativo):
+    """Série booleana de permissão de entrada por sentimento (None se desligado ou sem dados para o ativo)."""
+    if not sent_gate_on or ativo not in SENT_MAP:
+        return None
+    return SENT_MAP[ativo] >= sent_gate_thr
 
 # =====================================================================
 # 7. ABAS
@@ -1109,7 +1141,8 @@ with tab3:
         st.error("O gatilho de venda precisa ser menor que o de compra.")
 
     filtros_txt = " · ".join(f for f, on in [("regime BTC", use_regime and REGIME is not None),
-                                              ("não comprar esticado", skip_stretched)] if on) or "nenhum"
+                                              ("não comprar esticado", skip_stretched),
+                                              (f"entrada só com sentimento ≥ {sent_gate_thr}", sent_gate_on)] if on) or "nenhum"
     st.caption(f"Filtros ativos (sidebar): **{filtros_txt}**")
 
     if sent_err:
@@ -1143,6 +1176,7 @@ with tab3:
         else:
             h = hist_map[ticker]
             ind = compute_indicators(h["Close"], h.get("Volume"), P, sent_bt).dropna(subset=["Score"])
+            BT_KW = {**BT_KW, "entry_gate": sent_gate_for(ativo_bt)}
 
             if rodar:
                 res, m, trades = run_backtest(ind, gatilho_compra, gatilho_venda, fee_bt, **BT_KW)
@@ -1337,34 +1371,41 @@ with tab3:
                 else:
                     cobertura = float(sent_bt.reindex(ind1.index).notna().mean() * 100)
                     st.caption(f"Cobertura do sentimento no período: {cobertura:.0f}% dos dias.")
-                    with st.spinner("Rodando com e sem sentimento..."):
-                        _, m0, _ = run_backtest(ind0, gatilho_compra, gatilho_venda, fee_bt, **BT_KW)
-                        _, m1, _ = run_backtest(ind1, gatilho_compra, gatilho_venda, fee_bt, **BT_KW)
-                        _, o0, _ = run_backtest(ind0.iloc[252:], gatilho_compra, gatilho_venda, fee_bt, **BT_KW)
-                        _, o1, _ = run_backtest(ind1.iloc[252:], gatilho_compra, gatilho_venda, fee_bt, **BT_KW)
-                        _, _, p0 = permutation_test(h["Close"], P0s, gatilho_compra, gatilho_venda, fee_bt, n_iter=150,
-                                                    skip_stretched=skip_stretched)
-                        _, _, p1 = permutation_test(h["Close"], P1s, gatilho_compra, gatilho_venda, fee_bt, n_iter=150,
-                                                    sent=sent_bt, skip_stretched=skip_stretched)
+                    KW0 = {k: v for k, v in BT_KW.items() if k != "entry_gate"}     # comparação limpa, sem o gate
+                    gate = sent_bt >= sent_gate_thr
+                    with st.spinner("Rodando: sem sentimento · como componente · como filtro de entrada..."):
+                        _, m0, _ = run_backtest(ind0, gatilho_compra, gatilho_venda, fee_bt, **KW0)
+                        _, m1, _ = run_backtest(ind1, gatilho_compra, gatilho_venda, fee_bt, **KW0)
+                        _, m2, _ = run_backtest(ind0, gatilho_compra, gatilho_venda, fee_bt, entry_gate=gate, **KW0)
+                        _, o0, _ = run_backtest(ind0.iloc[252:], gatilho_compra, gatilho_venda, fee_bt, **KW0)
+                        _, o1, _ = run_backtest(ind1.iloc[252:], gatilho_compra, gatilho_venda, fee_bt, **KW0)
+                        _, o2, _ = run_backtest(ind0.iloc[252:], gatilho_compra, gatilho_venda, fee_bt, entry_gate=gate, **KW0)
+                        _, _, p0 = permutation_test(h["Close"], P0s, gatilho_compra, gatilho_venda, fee_bt, n_iter=120, **KW0)
+                        _, _, p1 = permutation_test(h["Close"], P1s, gatilho_compra, gatilho_venda, fee_bt, n_iter=120,
+                                                    sent=sent_bt, **KW0)
+                        _, _, p2 = permutation_test(h["Close"], P0s, gatilho_compra, gatilho_venda, fee_bt, n_iter=120,
+                                                    entry_gate=gate, **KW0)
                         corr1, by1, _ = signal_diagnostics(ind1, 20)
                     comp = pd.DataFrame({
                         "Sem sentimento": [m0["ret_robo"], m0["dd_robo"], m0["sharpe_robo"], m0["n_trades"], o0["ret_robo"], o0["sharpe_robo"], p0],
-                        "Com sentimento (0,25)": [m1["ret_robo"], m1["dd_robo"], m1["sharpe_robo"], m1["n_trades"], o1["ret_robo"], o1["sharpe_robo"], p1],
+                        "No score (peso 0,25)": [m1["ret_robo"], m1["dd_robo"], m1["sharpe_robo"], m1["n_trades"], o1["ret_robo"], o1["sharpe_robo"], p1],
+                        f"Filtro de entrada (≥ {sent_gate_thr})": [m2["ret_robo"], m2["dd_robo"], m2["sharpe_robo"], m2["n_trades"], o2["ret_robo"], o2["sharpe_robo"], p2],
                     }, index=["Retorno (%)", "Drawdown (%)", "Sharpe", "Trades", "Retorno OOS (%)", "Sharpe OOS", "p-valor"])
                     st.dataframe(comp.style.format("{:.2f}"), **_W)
+                    if o2["sharpe_robo"] > o0["sharpe_robo"] and p2 <= max(p0, 0.05):
+                        st.success(f"Como **filtro de entrada** o sentimento melhorou o Sharpe fora da amostra "
+                                   f"({o0['sharpe_robo']:.2f} → {o2['sharpe_robo']:.2f}). Ative em '🗞️ Sentimento' na sidebar "
+                                   "se isso se repetir em outros ativos.")
                     rs = corr1[corr1["Componente"] == "Sentimento (notícias)"]
                     if len(rs):
                         cs = float(rs["Spearman"].iloc[0])
                         st.metric("Correlação do sentimento com o retorno de 20 dias", f"{cs:+.3f}",
                                   "sinal relevante" if abs(cs) >= 0.05 else "ruído", delta_color="normal" if cs >= 0.05 else "inverse")
-                    melhor = (o1["sharpe_robo"] > o0["sharpe_robo"]) and (p1 <= p0)
-                    if melhor:
-                        st.success("O sentimento melhorou o Sharpe fora da amostra sem piorar o p-valor. "
-                                   "Repita em outros ativos antes de subir o peso na sidebar.")
+                    if (o1["sharpe_robo"] > o0["sharpe_robo"]) and (p1 <= p0):
+                        st.info("Como componente do score também melhorou — incomum; confirme em outros ativos antes de subir o peso.")
                     else:
-                        st.warning("O sentimento não melhorou o resultado fora da amostra neste ativo. "
-                                   "Mantenha o peso em 0 — o Score Final do radar continua usando sentimento ao vivo "
-                                   "apenas como informação, não como sinal validado.")
+                        st.warning("Como **componente do score** o sentimento não ajudou (em SOL piorou: atrasa as saídas). "
+                                   "Mantenha o peso em 0.")
                     st.dataframe(corr1.style.format({"Spearman": "{:+.3f}", "Pearson": "{:+.3f}"}), hide_index=True, **_W)
 
     # ------------------------------------------------------------------
@@ -1395,7 +1436,7 @@ with tab3:
             t = f"{a}-USD"
             if t in hist_v:
                 r = asset_verdict(hist_v[t]["Close"], P, gatilho_compra, gatilho_venda, fee_bt, n_perm=n_perm,
-                                  sent=SENT_MAP.get(a))
+                                  sent=SENT_MAP.get(a), entry_gate=sent_gate_for(a))
                 linhas.append({"Ativo": a, **({"Veredito": r["erro"]} if "erro" in r else r)})
             barra.progress((i + 1) / len(ativos_ver), text=f"{a} ({i + 1}/{len(ativos_ver)})")
         barra.empty()
@@ -1450,7 +1491,7 @@ with tab5:
             st.caption("Sem histórico: " + ", ".join(m.replace("-USD", "") for m in miss_c))
         with st.spinner("Rodando o robô em cada ativo..."):
             st.session_state["cesta"] = basket_backtest(hist_c, P, int(S0["buy_thr"]), int(S0["sell_thr"]),
-                                                        float(S0["fee"]), sent_map=SENT_MAP, **BT_KW)
+                                                        float(S0["fee"]), sent_map=SENT_MAP, gate_fn=sent_gate_for, **BT_KW)
         if st.session_state["cesta"] is None:
             st.error("Nenhum ativo com histórico suficiente.")
 
@@ -1708,9 +1749,23 @@ Com o CSV na pasta do app, o backtest ganha o botão **🗞️ Testar sentimento
 componente (peso 0,25), compara retorno, Sharpe, fora da amostra e p-valor, e mostra a correlação do sentimento com o
 retorno de 20 dias. **Sem look-ahead:** o score de uma semana só vale a partir da segunda-feira seguinte.
 
-O peso padrão é **0**. Só suba se o teste melhorar o Sharpe fora da amostra sem piorar o p-valor, em mais de um ativo.
-Se não melhorar — hipótese mais provável —, a conclusão também vale: o sentimento das manchetes fica como contexto
-no Radar, não como sinal.
+**Resultado em SOL (set/2021–mar/2026, tom diário do GDELT):**
+
+| Uso do sentimento | Retorno | DD | Sharpe | Trades | Sharpe OOS | p |
+|---|---|---|---|---|---|---|
+| nenhum | +583% | −55% | 0,97 | 34 | 1,05 | 0,00 |
+| como componente do score (0,25) | +229% | −72% | 0,72 | 33 | 0,78 | 0,08 |
+| **como filtro de entrada (≥ 50)** | **+685%** | −55% | **1,15** | 21 | **1,18** | 0,00 |
+
+- **No score, piora** em qualquer peso: o tom das notícias fica positivo com atraso e **segura o robô dentro das quedas**
+  — atrapalha a saída, que é o que sustenta a estratégia. Peso padrão continua **0**.
+- **Como confirmação de entrada, ajuda**: exige sentimento ≥ 50 para abrir compra (a venda não muda). Corta as
+  entradas quase pela metade (rompimentos falsos) e sobe o Sharpe fora da amostra de 1,05 para 1,18. Validado em
+  **um** ativo — por isso fica desligado por padrão, em "🗞️ Sentimento de notícias" na sidebar.
+- O tom isolado tem correlação de **+0,15** com o retorno de 10–20 dias (a maior de todos os componentes), mas
+  correlação alta não vira regra de trade automaticamente — é a lição da tarde inteira.
+- **Volume de cobertura (atenção)** tem correlação **negativa** com o retorno futuro (−0,15), mas usá-lo para
+  bloquear entradas destrói a estratégia: os rompimentos que pagam vêm com atenção alta. Descartado como filtro.
 
 ```
 python build_sentiment_timeline.py --ativos SOL,BTC,ETH,DOGE,AVAX,ADA,LINK,DOT --anos 5   # recomendado: ~10 chamadas/ativo
