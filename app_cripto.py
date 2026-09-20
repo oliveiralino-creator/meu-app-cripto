@@ -75,6 +75,14 @@ except Exception:
     _W = {"use_container_width": True}
 
 
+# background_gradient do pandas exige matplotlib; sem ele, desliga as cores em vez de quebrar o app
+try:
+    import matplotlib  # noqa: F401
+except ImportError:
+    from pandas.io.formats.style import Styler as _Styler
+    _Styler.background_gradient = lambda self, *a, **k: self
+
+
 # =====================================================================
 # 1. CAMADA DE DADOS (com retry e erro explícito)
 # =====================================================================
@@ -1035,7 +1043,7 @@ with tab1:
             df_clean.style.format({"Preço (USD)": fmt_price, "Var 1h (%)": "{:.2f}%", "Var 24h (%)": "{:.2f}%",
                                    "Var 7d (%)": "{:.2f}%", "Vol/Cap (%)": "{:.1f}%",
                                    "Score Técnico": "{:.0f}", "Score Final": "{:.0f}"})
-            .background_gradient(subset=["Score Final"], cmap="RdYlGn", vmin=0, vmax=100),
+                .background_gradient(subset=["Score Final"], cmap="RdYlGn", vmin=0, vmax=100),
             hide_index=True, **_W)
 
     with st.expander("📰 Notícias gerais (Cointelegraph)"):
@@ -1105,7 +1113,7 @@ with tab2:
         st.dataframe(show.style.format({"Preco_Compra": fmt_price, "Preco_Atual": fmt_price, "Preco_Venda": fmt_price,
                                         "Investido": "${:,.2f}", "Valor": "${:,.2f}", "P&L (USD)": "${:,.2f}",
                                         "Retorno (%)": "{:.2f}%", "Quantidade": "{:g}"})
-                     .background_gradient(subset=["Retorno (%)"], cmap="RdYlGn", vmin=-10, vmax=10),
+                .background_gradient(subset=["Retorno (%)"], cmap="RdYlGn", vmin=-10, vmax=10),
                      hide_index=True, **_W)
         b1, b2 = st.columns(2)
         b1.download_button("📥 Baixar carteira (CSV)", df_cart[CARTEIRA_COLS].to_csv(index=False).encode("utf-8"),
@@ -1225,7 +1233,7 @@ with tab3:
                         t["Saída"] = pd.to_datetime(t["Saída"]).dt.strftime("%d/%m/%Y")
                         st.dataframe(t.style.format({"Preço Entrada": fmt_price, "Preço Saída": fmt_price,
                                                      "Retorno (%)": "{:.2f}%"})
-                                     .background_gradient(subset=["Retorno (%)"], cmap="RdYlGn", vmin=-15, vmax=15),
+                .background_gradient(subset=["Retorno (%)"], cmap="RdYlGn", vmin=-15, vmax=15),
                                      hide_index=True, **_W)
                 exp_cols = ["Close", "RSI", "EMA_F", "EMA_S", "MACD", "Signal", "MA_L", "Mom", "Vol",
                             "S_RSI", "S_TREND", "S_MOM", "S_VOL", "Score", "Esticado", "Pos", "Ret_Robo",
@@ -1248,7 +1256,7 @@ with tab3:
                     grid.head(15).style
                     .format({"Sharpe Treino": "{:.2f}", "Retorno Treino (%)": "{:.1f}%", "Sharpe Teste": "{:.2f}",
                              "Retorno Teste (%)": "{:.1f}%", "DD Teste (%)": "{:.1f}%"})
-                    .background_gradient(subset=["Sharpe Teste"], cmap="RdYlGn", vmin=-2, vmax=3),
+                .background_gradient(subset=["Sharpe Teste"], cmap="RdYlGn", vmin=-2, vmax=3),
                     hide_index=True, **_W)
                 fig_hm = px.density_heatmap(grid, x="Compra ≥", y="Venda ≤", z="Sharpe Teste", histfunc="avg",
                                             color_continuous_scale="RdYlGn", template="plotly_white",
@@ -1306,7 +1314,7 @@ with tab3:
                         t[c] = pd.to_datetime(t[c]).dt.strftime("%d/%m/%Y")
                     st.dataframe(t.style.format({"Sharpe Treino": "{:.2f}", "Retorno Teste (%)": "{:.1f}%",
                                                  "Hold Teste (%)": "{:.1f}%"})
-                                 .background_gradient(subset=["Retorno Teste (%)"], cmap="RdYlGn", vmin=-30, vmax=30),
+                .background_gradient(subset=["Retorno Teste (%)"], cmap="RdYlGn", vmin=-30, vmax=30),
                                  hide_index=True, **_W)
 
             if diagnosticar:
@@ -1318,10 +1326,10 @@ with tab3:
                 corr, by_bucket, n = signal_diagnostics(ind, hz)
                 d1, d2 = st.columns([1, 1])
                 d1.dataframe(corr.style.format({"Spearman": "{:+.3f}", "Pearson": "{:+.3f}"})
-                             .background_gradient(subset=["Spearman"], cmap="RdYlGn", vmin=-0.2, vmax=0.2),
+                .background_gradient(subset=["Spearman"], cmap="RdYlGn", vmin=-0.2, vmax=0.2),
                              hide_index=True, **_W)
                 d2.dataframe(by_bucket.style.format({f"Retorno médio {hz}d (%)": "{:+.2f}%", "% dias positivos": "{:.0f}%"})
-                             .background_gradient(subset=[f"Retorno médio {hz}d (%)"], cmap="RdYlGn", vmin=-5, vmax=5),
+                .background_gradient(subset=[f"Retorno médio {hz}d (%)"], cmap="RdYlGn", vmin=-5, vmax=5),
                              hide_index=True, **_W)
                 fig_b = px.bar(by_bucket, x="Faixa de Score", y=f"Retorno médio {hz}d (%)", template="plotly_white",
                                title=f"Retorno médio {hz} dias à frente por faixa de score (N={n})",
@@ -1508,7 +1516,7 @@ with tab5:
         h4.metric("Dias no histórico", f"{B['dias']}")
         st.dataframe(B["estado"].style.format({"Preço": fmt_price, "Score": "{:.0f}", "RSI": "{:.0f}",
                                                "Tendência": "{:.0f}", "Momentum": "{:.0f}", "Risco": "{:.0f}"})
-                     .background_gradient(subset=["Score"], cmap="RdYlGn", vmin=0, vmax=100), hide_index=True, **_W)
+                .background_gradient(subset=["Score"], cmap="RdYlGn", vmin=0, vmax=100), hide_index=True, **_W)
         st.caption("'Há (dias)' = há quantos dias o robô está nesse estado. Score ≥ gatilho de compra com posição "
                    "'Em caixa' significa que a compra vale a partir do próximo fechamento.")
 
@@ -1537,13 +1545,13 @@ with tab5:
         with cA:
             st.markdown("**Por ano**")
             st.dataframe(B["por_ano"].style.format("{:.0f}%")
-                         .background_gradient(subset=["Robô (%)"], cmap="RdYlGn", vmin=-60, vmax=60), **_W)
+                .background_gradient(subset=["Robô (%)"], cmap="RdYlGn", vmin=-60, vmax=60), **_W)
         with cB:
             st.markdown("**Contribuição por ativo** (pp do retorno da cesta)")
             st.dataframe(B["por_ativo"].style.format({"Robô (%)": "{:.0f}%", "Hold (%)": "{:.0f}%", "DD robô (%)": "{:.0f}%",
                                                       "DD hold (%)": "{:.0f}%", "Sharpe robô": "{:.2f}", "Sharpe hold": "{:.2f}",
                                                       "Exposição (%)": "{:.0f}%", "Contribuição p/ cesta (pp)": "{:+.1f}"})
-                         .background_gradient(subset=["Contribuição p/ cesta (pp)"], cmap="RdYlGn", vmin=-30, vmax=30),
+                .background_gradient(subset=["Contribuição p/ cesta (pp)"], cmap="RdYlGn", vmin=-30, vmax=30),
                          hide_index=True, **_W)
         piores = B["por_ativo"][B["por_ativo"]["Sharpe robô"] < B["por_ativo"]["Sharpe hold"]]["Ativo"].tolist()
         if piores:
