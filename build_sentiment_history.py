@@ -13,7 +13,8 @@ Saída: sentimento_historico.csv (uma linha por ativo × semana). O script é re
 continua de onde parou. Com --ai, semanas já pontuadas pela IA não são reenviadas.
 Coloque o CSV na mesma pasta do app_cripto.py; o backtest passa a oferecer o componente "Sentimento".
 
-Custo/tempo: ~1,3 s por consulta GDELT → 8 ativos × 260 semanas ≈ 45 min. Gemini: uma chamada por semana/ativo;
+Custo/tempo: o GDELT tolera ~1 consulta a cada 5 s (pausa adaptativa) → 8 ativos × 260 semanas ≈ 3 h.
+Rode em várias sessões (Ctrl+C salva) ou um ativo por vez: --ativos SOL. Gemini: uma chamada por semana/ativo;
 no plano gratuito, use --ai em sessões de ~200 semanas por dia ou o modelo -lite.
 """
 
@@ -25,8 +26,11 @@ import sys
 import time
 from datetime import datetime, timedelta, timezone
 
+import warnings
 import pandas as pd
 import requests
+
+warnings.simplefilter("ignore", FutureWarning)
 
 # --- termos de busca por ativo (nomes que aparecem em manchetes) ---
 TERMOS = {
@@ -67,14 +71,32 @@ def sentiment_lexical(titles):
 GDELT = "https://api.gdeltproject.org/api/v2/doc/doc"
 
 
-def gdelt_headlines(query, start, end, maxrecords=75, retries=6):
+class Ritmo:
+    """Pausa adaptativa: sobe ao levar 429, desce devagar após sucessos. GDELT tolera ~1 chamada a cada 5 s."""
+    def __init__(self, inicial=5.0, minimo=3.0, maximo=60.0):
+        self.pausa, self.minimo, self.maximo, self.ok_seguidos = inicial, minimo, maximo, 0
+
+    def sucesso(self):
+        self.ok_seguidos += 1
+        if self.ok_seguidos >= 5:
+            self.pausa, self.ok_seguidos = max(self.minimo, self.pausa * 0.85), 0
+
+    def limite(self):
+        self.ok_seguidos = 0
+        self.pausa = min(self.maximo, self.pausa * 1.6)
+
+
+RITMO = Ritmo()
+
+
+def gdelt_headlines(query, start, end, maxrecords=75, retries=8):
     params = {"query": f"{query} sourcelang:eng", "mode": "artlist", "maxrecords": maxrecords, "sort": "hybridrel",
               "format": "json", "startdatetime": start.strftime("%Y%m%d%H%M%S"), "enddatetime": end.strftime("%Y%m%d%H%M%S")}
-    wait = 5
     for i in range(retries):
         try:
             r = requests.get(GDELT, params=params, timeout=30, headers={"User-Agent": "crypto-sentiment-research/1.0"})
             if r.status_code == 200:
+                RITMO.sucesso()
                 try:
                     arts = r.json().get("articles", [])
                 except ValueError:
@@ -87,10 +109,11 @@ def gdelt_headlines(query, start, end, maxrecords=75, retries=6):
                         seen.add(key); titles.append(t)
                 return titles
             if r.status_code == 429:
-                print(f"    429 (limite) — aguardando {wait}s", flush=True); time.sleep(wait); wait = min(wait * 2, 90); continue
-            print(f"    HTTP {r.status_code}", flush=True); time.sleep(wait)
+                RITMO.limite()
+                print(f"    429 (limite) — pausa agora {RITMO.pausa:.0f}s", flush=True); time.sleep(RITMO.pausa); continue
+            print(f"    HTTP {r.status_code}", flush=True); time.sleep(RITMO.pausa)
         except requests.RequestException as e:
-            print(f"    rede: {e}", flush=True); time.sleep(wait)
+            print(f"    rede: {e}", flush=True); time.sleep(RITMO.pausa)
     return None
 
 
@@ -130,10 +153,11 @@ def main():
     ap.add_argument("--saida", default="sentimento_historico.csv")
     ap.add_argument("--ai", action="store_true", help="pontuar também com Gemini (precisa GEMINI_API_KEY)")
     ap.add_argument("--modelo", default="gemini-2.5-flash-lite")
-    ap.add_argument("--pausa", type=float, default=1.3, help="segundos entre consultas GDELT")
+    ap.add_argument("--pausa", type=float, default=5.0, help="pausa inicial entre consultas GDELT (adapta-se sozinha)")
     ap.add_argument("--max-semanas", type=int, default=0, help="limite de semanas por execução (0 = todas)")
     args = ap.parse_args()
 
+    RITMO.pausa = args.pausa
     ativos = [a.strip().upper() for a in args.ativos.split(",") if a.strip()]
     hoje = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
     inicio = hoje - timedelta(days=int(args.anos * 365))
@@ -142,13 +166,14 @@ def main():
 
     cols = ["data", "ativo", "n_manchetes", "sent_lexico", "sent_ia", "fonte"]
     if os.path.exists(args.saida):
-        df = pd.read_csv(args.saida, parse_dates=["data"])
+        df = pd.read_csv(args.saida)
+        df["data"] = pd.to_datetime(df["data"], format="mixed", utc=True).dt.tz_localize(None).dt.normalize()
         for c in cols:
             if c not in df.columns:
                 df[c] = pd.NA
     else:
         df = pd.DataFrame(columns=cols)
-    feitos = set(zip(df["ativo"], pd.to_datetime(df["data"]).dt.strftime("%Y-%m-%d")))
+    feitos = set(zip(df["ativo"], pd.to_datetime(df["data"], format="mixed", utc=True).dt.strftime("%Y-%m-%d")))
 
     client = None
     if args.ai:
@@ -167,10 +192,10 @@ def main():
                 if chave in feitos:
                     # com --ai, completa linhas que ainda não têm sent_ia
                     if args.ai:
-                        m = (df["ativo"] == a) & (pd.to_datetime(df["data"]).dt.strftime("%Y-%m-%d") == chave[1])
+                        m = (df["ativo"] == a) & (pd.to_datetime(df["data"], format="mixed", utc=True).dt.strftime("%Y-%m-%d") == chave[1])
                         row = df[m]
                         if len(row) and pd.isna(row["sent_ia"].iloc[0]) and int(row["n_manchetes"].iloc[0]) >= 3:
-                            titles = gdelt_headlines(termo, ws, ws + timedelta(days=7)); time.sleep(args.pausa)
+                            titles = gdelt_headlines(termo, ws, ws + timedelta(days=7)); time.sleep(RITMO.pausa)
                             if titles:
                                 s = sentiment_ai(client, args.modelo, a, titles)
                                 df.loc[m, "sent_ia"] = s; df.to_csv(args.saida, index=False)
@@ -179,9 +204,9 @@ def main():
                 if args.max_semanas and n_exec >= args.max_semanas:
                     raise KeyboardInterrupt
                 titles = gdelt_headlines(termo, ws, ws + timedelta(days=7))
-                time.sleep(args.pausa)
+                time.sleep(RITMO.pausa)
                 if titles is None:
-                    print(f"  {a} {chave[1]}  FALHOU (tentar depois)", flush=True); continue
+                    print(f"  {a} {chave[1]}  FALHOU (será tentada na próxima execução)", flush=True); continue
                 lex = sentiment_lexical(titles)
                 ia = sentiment_ai(client, args.modelo, a, titles) if (args.ai and len(titles) >= 3) else None
                 linha = {"data": ws.strftime("%Y-%m-%d"), "ativo": a, "n_manchetes": len(titles), "sent_lexico": lex, "sent_ia": ia, "fonte": "gdelt"}

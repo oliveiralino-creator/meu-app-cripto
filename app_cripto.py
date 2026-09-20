@@ -283,11 +283,27 @@ def load_sentiment_history(path: str = SENT_FILE, prefer_ai: bool = True):
         return {}, None
     try:
         df = pd.read_csv(path)
-        df["data"] = pd.to_datetime(df["data"], utc=True).dt.tz_localize(None).dt.normalize()
+        df["data"] = pd.to_datetime(df["data"], format="mixed", utc=True).dt.tz_localize(None).dt.normalize()
     except Exception as e:
         return {}, f"não foi possível ler {path}: {e}"
     out = {}
+    if "tone" in df.columns:
+        # ---- formato DIÁRIO (build_sentiment_timeline.py): tom do GDELT, escala ~ -10..+10 ----
+        for a, g in df.groupby("ativo"):
+            g = g.sort_values("data").dropna(subset=["tone"])
+            s = pd.Series(g["tone"].values, index=pd.to_datetime(g["data"])).astype(float)
+            s = s[~s.index.duplicated()].resample("D").mean()
+            # suaviza (7 dias) e normaliza pela própria história do ativo, só com o passado (rolling z-score)
+            sm = s.rolling(7, min_periods=3).mean()
+            mu = sm.rolling(365, min_periods=60).mean()
+            sd = sm.rolling(365, min_periods=60).std()
+            z = ((sm - mu) / sd.replace(0, np.nan)).clip(-3, 3)
+            score = (50 + z * (50 / 3)).shift(1)               # tom de hoje só é conhecido amanhã
+            out[a] = {"serie": score, "fonte": "gdelt_tone", "semanas": int(score.notna().sum() // 7),
+                      "de": g["data"].min().date(), "ate": g["data"].max().date()}
+        return out, None
     for a, g in df.groupby("ativo"):
+        # ---- formato SEMANAL (build_sentiment_history.py) ----
         g = g.sort_values("data")
         col = "sent_ia" if prefer_ai and "sent_ia" in g and g["sent_ia"].notna().sum() >= 0.5 * len(g) else "sent_lexico"
         s = pd.Series(g[col].values, index=pd.to_datetime(g["data"]) + pd.Timedelta(days=7)).astype(float)
@@ -1697,9 +1713,15 @@ Se não melhorar — hipótese mais provável —, a conclusão também vale: o 
 no Radar, não como sinal.
 
 ```
-python build_sentiment_history.py --ativos SOL,BTC,ETH,DOGE,AVAX --anos 5
-python build_sentiment_history.py --ativos SOL --anos 5 --ai        # requer GEMINI_API_KEY no ambiente
+python build_sentiment_timeline.py --ativos SOL,BTC,ETH,DOGE,AVAX,ADA,LINK,DOT --anos 5   # recomendado: ~10 chamadas/ativo
+python build_sentiment_history.py  --ativos SOL --anos 5 --ai   # semanal por manchetes + Gemini (lento: 1 chamada/semana)
 ```
+
+**Dois coletores:** o `timeline` usa o tom que o próprio GDELT calcula sobre o texto completo dos artigos, dia a dia,
+com uma chamada por semestre — rápido e sem esbarrar no limite de taxa. O `history` baixa manchetes semana a semana
+e pontua com léxico/IA — mais controlável, mas o GDELT limita a ~1 chamada por minuto e o léxico converge para
+neutro com muitas manchetes. Comece pelo `timeline`. No formato diário, o app suaviza o tom em 7 dias, normaliza pela
+história do ativo (z-score móvel de 1 ano, só com o passado) e aplica com 1 dia de atraso.
 """)
 
     with g6:
